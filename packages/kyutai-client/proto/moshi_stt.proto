@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package moshi.stt;
+
+service SpeechToText {
+  // Streaming speech recognition
+  rpc StreamingRecognize(stream StreamingRecognizeRequest) returns (stream StreamingRecognizeResponse);
+  
+  // Single utterance recognition
+  rpc Recognize(RecognizeRequest) returns (RecognizeResponse);
+}
+
+message RecognizeRequest {
+  RecognitionConfig config = 1;
+  bytes audio_content = 2;
+}
+
+message StreamingRecognizeRequest {
+  oneof streaming_request {
+    StreamingRecognitionConfig streaming_config = 1;
+    bytes audio_content = 2;
+  }
+}
+
+message RecognitionConfig {
+  // Audio encoding
+  AudioEncoding encoding = 1;
+  
+  // Sample rate in Hz
+  int32 sample_rate_hertz = 2;
+  
+  // Language code (e.g., "en-US", "fr-FR")
+  string language_code = 3;
+  
+  // Maximum number of recognition alternatives
+  int32 max_alternatives = 4;
+  
+  // Enable profanity filter
+  bool profanity_filter = 5;
+  
+  // Enable word time offsets
+  bool enable_word_time_offsets = 6;
+}
+
+message StreamingRecognitionConfig {
+  RecognitionConfig config = 1;
+  
+  // Enable interim results
+  bool interim_results = 2;
+  
+  // Enable voice activity detection
+  bool enable_voice_activity_events = 3;
+}
+
+message RecognizeResponse {
+  repeated SpeechRecognitionResult results = 1;
+}
+
+message StreamingRecognizeResponse {
+  repeated SpeechRecognitionResult results = 1;
+  
+  // Speech event type
+  SpeechEventType speech_event_type = 2;
+}
+
+message SpeechRecognitionResult {
+  repeated SpeechRecognitionAlternative alternatives = 1;
+  
+  // Result finalization indicator
+  bool is_final = 2;
+  
+  // Stability of the result (0.0-1.0)
+  float stability = 3;
+  
+  // Time offset from the beginning of audio
+  int64 result_end_time_nanos = 4;
+}
+
+message SpeechRecognitionAlternative {
+  // Transcript text
+  string transcript = 1;
+  
+  // Confidence score (0.0-1.0)
+  float confidence = 2;
+  
+  // Word-level information
+  repeated WordInfo words = 3;
+}
+
+message WordInfo {
+  // Start time offset
+  int64 start_time_nanos = 1;
+  
+  // End time offset
+  int64 end_time_nanos = 2;
+  
+  // Word text
+  string word = 3;
+  
+  // Confidence score
+  float confidence = 4;
+}
+
+enum AudioEncoding {
+  ENCODING_UNSPECIFIED = 0;
+  LINEAR16 = 1;
+  FLAC = 2;
+  MULAW = 3;
+  AMR = 4;
+  AMR_WB = 5;
+  OGG_OPUS = 6;
+  SPEEX_WITH_HEADER_BYTE = 7;
+  WEBM_OPUS = 8;
+}
+
+enum SpeechEventType {
+  SPEECH_EVENT_UNSPECIFIED = 0;
+  END_OF_SINGLE_UTTERANCE = 1;
+  VOICE_ACTIVITY_BEGIN = 2;
+  VOICE_ACTIVITY_END = 3;
+}

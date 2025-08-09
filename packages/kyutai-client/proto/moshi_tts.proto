@@ -1,0 +1,162 @@
+syntax = "proto3";
+
+package moshi.tts;
+
+service TextToSpeech {
+  // Streaming text-to-speech synthesis
+  rpc StreamingSynthesize(stream StreamingSynthesizeRequest) returns (stream StreamingSynthesizeResponse);
+  
+  // Single text-to-speech synthesis
+  rpc Synthesize(SynthesizeRequest) returns (SynthesizeResponse);
+}
+
+message SynthesizeRequest {
+  SynthesisInput input = 1;
+  VoiceSelectionParams voice = 2;
+  AudioConfig audio_config = 3;
+}
+
+message StreamingSynthesizeRequest {
+  oneof streaming_request {
+    StreamingSynthesisConfig streaming_config = 1;
+    SynthesisInput input = 2;
+  }
+}
+
+message SynthesisInput {
+  oneof input_source {
+    string text = 1;
+    string ssml = 2;
+  }
+}
+
+message VoiceSelectionParams {
+  // Language code (e.g., "en-US", "fr-FR")
+  string language_code = 1;
+  
+  // Voice name
+  string name = 2;
+  
+  // Voice gender
+  SsmlVoiceGender ssml_gender = 3;
+  
+  // Custom voice configuration
+  CustomVoiceParams custom_voice = 4;
+}
+
+message CustomVoiceParams {
+  // Voice model identifier
+  string model = 1;
+  
+  // Voice characteristics
+  map<string, float> voice_params = 2;
+}
+
+message AudioConfig {
+  // Audio encoding
+  AudioEncoding audio_encoding = 1;
+  
+  // Speaking rate (0.25 to 4.0)
+  float speaking_rate = 2;
+  
+  // Pitch adjustment (-20.0 to 20.0 semitones)
+  float pitch = 3;
+  
+  // Volume gain (-96.0 to 16.0 dB)
+  float volume_gain_db = 4;
+  
+  // Sample rate in Hz
+  int32 sample_rate_hertz = 5;
+  
+  // Audio effects
+  repeated AudioEffect effects = 6;
+}
+
+message AudioEffect {
+  oneof effect_type {
+    EchoEffect echo = 1;
+    ReverbEffect reverb = 2;
+    EqualizerEffect equalizer = 3;
+  }
+}
+
+message EchoEffect {
+  float delay_ms = 1;
+  float decay = 2;
+}
+
+message ReverbEffect {
+  float room_size = 1;
+  float damping = 2;
+  float wet_level = 3;
+  float dry_level = 4;
+}
+
+message EqualizerEffect {
+  repeated BandGain bands = 1;
+}
+
+message BandGain {
+  float frequency_hz = 1;
+  float gain_db = 2;
+  float bandwidth_hz = 3;
+}
+
+message StreamingSynthesisConfig {
+  VoiceSelectionParams voice = 1;
+  AudioConfig audio_config = 2;
+  
+  // Enable low latency streaming
+  bool enable_low_latency = 3;
+  
+  // Chunk size for streaming
+  int32 chunk_size_ms = 4;
+}
+
+message SynthesizeResponse {
+  // Audio content
+  bytes audio_content = 1;
+  
+  // Time points for words/phonemes
+  repeated Timepoint timepoints = 2;
+  
+  // Audio configuration used
+  AudioConfig audio_config = 3;
+}
+
+message StreamingSynthesizeResponse {
+  // Audio chunk
+  bytes audio_content = 1;
+  
+  // Time points for this chunk
+  repeated Timepoint timepoints = 2;
+  
+  // Indicates if this is the final chunk
+  bool is_final = 3;
+}
+
+message Timepoint {
+  // Mark name (word, phoneme, etc.)
+  string mark_name = 1;
+  
+  // Time offset in seconds
+  float time_seconds = 2;
+}
+
+enum AudioEncoding {
+  AUDIO_ENCODING_UNSPECIFIED = 0;
+  LINEAR16 = 1;
+  MP3 = 2;
+  OGG_OPUS = 3;
+  MULAW = 4;
+  ALAW = 5;
+  FLAC = 6;
+  WEBM_OPUS = 7;
+}
+
+enum SsmlVoiceGender {
+  SSML_VOICE_GENDER_UNSPECIFIED = 0;
+  MALE = 1;
+  FEMALE = 2;
+  NEUTRAL = 3;
+}

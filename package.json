@@ -1,0 +1,29 @@
+{
+  "name": "phonic0-mvp",
+  "version": "1.5.0",
+  "description": "AI calling agent platform MVP",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:auth": "npm run dev --workspace=auth-service",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "dev:kyutai": "npm run dev --workspace=kyutai-client",
+    "dev:orchestrator": "npm run dev --workspace=orchestrator",
+    "dev:gateway": "npm run dev --workspace=gateway-service",
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces",
+    "clean": "npm run clean --workspaces",
+    "dev:all": "concurrently \"npm run dev:auth\" \"npm run dev:frontend\"",
+    "dev:with-kyutai": "concurrently \"npm run dev:auth\" \"npm run dev:frontend\" \"npm run dev:kyutai\"",
+    "dev:full-stack": "concurrently \"npm run dev:auth\" \"npm run dev:frontend\" \"npm run dev:kyutai\" \"npm run dev:orchestrator\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "concurrently": "^9.2.0",
+    "nodemon": "^3.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.3.0"
+  }
+}

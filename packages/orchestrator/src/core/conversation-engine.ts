@@ -454,14 +454,16 @@ export class ConversationEngine {
     try {
       const startTime = Date.now();
       
-      // Use Murf TTS
-      const { MurfTTS } = await import('../services/tts/murf-tts');
-      const murf = new MurfTTS({
-        apiKey: process.env.MURF_API_KEY!,
-        voiceId: process.env.MURF_VOICE_ID || 'en-US_Allison',
-        apiUrl: process.env.MURF_API_URL || 'https://api.murf.ai/v1/speech',
+      // Use Chatterbox TTS
+      const { ChatterboxTTS } = await import('../services/tts/chatterbox-tts');
+      const chatterbox = new ChatterboxTTS({
+        pythonPath: process.env.PYTHON_PATH || 'python3',
+        device: process.env.CHATTERBOX_DEVICE || 'cpu',
+        exaggeration: parseFloat(process.env.CHATTERBOX_EXAGGERATION || '0.5'),
+        cfgWeight: parseFloat(process.env.CHATTERBOX_CFG_WEIGHT || '0.5'),
+        voicePromptPath: process.env.CHATTERBOX_VOICE_PROMPT_PATH,
       });
-      const audioBuffer = await murf.synthesize(text);
+      const audioBuffer = await chatterbox.synthesize(text);
 
       const ttsLatency = Date.now() - startTime;
 
@@ -473,7 +475,7 @@ export class ConversationEngine {
 
       session.state.lastTTSAudio = audioBuffer;
 
-      console.log(`�� Generated speech (${audioBuffer.length} bytes, ${ttsLatency}ms)`);
+      console.log(` Generated speech (${audioBuffer.length} bytes, ${ttsLatency}ms)`);
 
       this.sendMessage(sessionId, {
         type: 'speech_generated',

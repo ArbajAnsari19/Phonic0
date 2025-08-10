@@ -27,95 +27,93 @@ export class AuthIntegration {
   }
 
   async initialize(): Promise<void> {
-    try {
-      // Check if auth service is available
-      const response = await axios.get(`${this.baseUrl}/health`);
-      
-      if (response.data.success) {
-        console.log('✅ Auth integration initialized');
-      } else {
+    const maxWaitMs = parseInt(process.env.AUTH_INIT_TIMEOUT_MS || '60000'); // 60s default
+    const start = Date.now();
+    let attempt = 0;
+
+    while (true) {
+      attempt += 1;
+      try {
+        const response = await axios.get(`${this.baseUrl}/health`, { timeout: 3000 });
+        if (response.data && (response.data.success === true || response.status === 200)) {
+          console.log('✅ Auth integration initialized');
+          return;
+        }
         throw new Error('Auth service health check failed');
-      }
-    } catch (error) {
-      console.error('❌ Auth integration failed:', error);
-      
-      if (process.env.DEMO_MODE === 'true') {
-        console.log('🎭 Continuing in demo mode without auth service');
-      } else {
-        throw error;
+      } catch (error) {
+        const elapsed = Date.now() - start;
+        if (elapsed >= maxWaitMs) {
+          console.error('❌ Auth integration failed after retries:', error);
+          if (process.env.DEMO_MODE === 'true') {
+            console.log('🎭 Continuing in demo mode without auth service');
+            return;
+          }
+          throw error;
+        }
+        const backoff = Math.min(5000, 500 * attempt); // 0.5s, 1s, ..., up to 5s
+        console.log(`⌛ Waiting for auth-service... retry in ${backoff}ms (attempt ${attempt})`);
+        await new Promise((r) => setTimeout(r, backoff));
       }
     }
   }
 
   async verifyToken(token: string): Promise<User | null> {
     try {
-      // First try to verify JWT locally
-      const decoded = jwt.verify(token, this.jwtSecret) as any;
-      
-      if (!decoded.userId) {
-        return null;
+      try { jwt.verify(token, this.jwtSecret); } catch (e) {
+        console.warn('⚠️ [Auth] Local JWT verify failed (continuing with remote):', (e as Error).message);
       }
-
-      // Get user details from auth service
+      // Always confirm with auth-service
       const response = await axios.get(`${this.baseUrl}/api/auth/profile`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-
-      if (response.data.success) {
-        return {
-          id: response.data.data.id,
-          email: response.data.data.email,
-          name: response.data.data.name,
-        };
+      if (response.data?.success && response.data.data?.user) {
+        const u = response.data.data.user;
+        console.log('✅ [Auth] Verified with auth-service', { userId: u.id, email: u.email });
+        return { id: u.id, email: u.email, name: u.name };
       }
-
+      console.error('❌ [Auth] Invalid profile response', { data: response.data });
       return null;
-
-    } catch (error) {
-      console.error('Token verification failed:', error);
-      
-      // Return mock user in demo mode
+    } catch (error: any) {
+      console.error('❌ [Auth] Token verification failed', {
+        status: error?.response?.status,
+        data: error?.response?.data,
+        message: error?.message,
+      });
       if (process.env.DEMO_MODE === 'true') {
-        return {
-          id: 'demo-user-id',
-          email: 'demo@example.com',
-          name: 'Demo User',
-        };
+        return { id: 'demo-user-id', email: 'demo@example.com', name: 'Demo User' };
       }
-      
       return null;
     }
   }
 
-  async getBrainById(brainId: string, userId: string): Promise<Brain | null> {
+  async getBrainById(brainId: string, userId: string, token?: string): Promise<Brain | null> {
     try {
-      const response = await axios.get(`${this.baseUrl}/api/auth/brains/${brainId}`, {
-        headers: { Authorization: `Bearer ${this.generateMockToken(userId)}` },
-      });
-
-      if (response.data.success) {
-        const brain = response.data.data;
+      const headers = token ? { Authorization: `Bearer ${token}` } : {};
+      const response = await axios.get(`${this.baseUrl}/api/brain/${brainId}`, { headers });
+      if (response.data?.success && response.data.data?.brain) {
+        const b = response.data.data.brain;
+        console.log('✅ [Auth] Brain fetched', { brainId: b._id, name: b.name });
         return {
-          id: brain.id,
-          name: brain.name,
-          instructions: brain.instructions,
-          isActive: brain.isActive,
-          userId: brain.userId,
-          createdAt: new Date(brain.createdAt),
-          updatedAt: new Date(brain.updatedAt),
+          id: b._id,
+          name: b.name,
+          instructions: b.instructions,
+          isActive: b.isActive,
+          userId: b.userId,
+          createdAt: new Date(b.createdAt),
+          updatedAt: new Date(b.updatedAt),
         };
       }
-
+      console.error('❌ [Auth] Brain fetch invalid response', { data: response.data });
       return null;
-
-    } catch (error) {
-      console.error(`Error fetching brain ${brainId}:`, error);
-      
-      // Return mock brain in demo mode
+    } catch (error: any) {
+      console.error(`❌ [Auth] Error fetching brain ${brainId}`, {
+        status: error?.response?.status,
+        data: error?.response?.data,
+        message: error?.message,
+      });
       if (process.env.DEMO_MODE === 'true') {
         return this.generateMockBrain(brainId);
       }
-      
       return null;
     }
   }

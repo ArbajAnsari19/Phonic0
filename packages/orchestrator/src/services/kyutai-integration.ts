@@ -75,15 +75,14 @@ export class KyutaiIntegration {
 
   async createAudioSession(): Promise<string> {
     try {
-      // Create WebSocket connection to Kyutai service
       const wsUrl = this.baseUrl.replace('http://', 'ws://').replace('https://', 'wss://');
       const ws = new WebSocket(wsUrl);
-      
+
       return new Promise((resolve, reject) => {
         ws.on('open', () => {
           const sessionId = this.generateSessionId();
           this.audioSessions.set(sessionId, ws);
-          
+
           console.log(`🎧 Created Kyutai audio session: ${sessionId}`);
           resolve(sessionId);
         });
@@ -95,7 +94,8 @@ export class KyutaiIntegration {
         ws.on('message', (data) => {
           try {
             const message = JSON.parse(data.toString());
-            this.handleKyutaiMessage(message);
+            // Pass along the local session id so we can hit the right callback
+            this.handleKyutaiMessage(message, /* local */ this.findLocalSessionIdByWS(ws));
           } catch (error) {
             console.error('Error parsing Kyutai message:', error);
           }
@@ -104,14 +104,11 @@ export class KyutaiIntegration {
 
     } catch (error) {
       console.error('Error creating Kyutai audio session:', error);
-      
-      // Return mock session ID in demo mode
       if (process.env.DEMO_MODE === 'true') {
         const mockSessionId = this.generateSessionId();
         console.log(`🎭 Created mock audio session: ${mockSessionId}`);
         return mockSessionId;
       }
-      
       throw error;
     }
   }
@@ -259,38 +256,46 @@ export class KyutaiIntegration {
     this.sttCallbacks.set(sessionId, callback);
   }
 
-  private handleKyutaiMessage(message: any): void {
+  private handleKyutaiMessage(message: any, localSessionId?: string): void {
     switch (message.type) {
-      case 'stt_result':
-        const callback = this.sttCallbacks.get(message.sessionId);
-        if (callback && message.data.results && message.data.results.length > 0) {
+      case 'stt_result': {
+        const sid = localSessionId || message.sessionId; // prefer local session mapping
+        const callback = sid ? this.sttCallbacks.get(sid) : undefined;
+        if (callback && message.data?.results?.length > 0) {
           const result = message.data.results[0];
-          if (result.isFinal) {
-            callback({
-              transcript: result.alternatives[0].transcript,
-              confidence: result.alternatives[0].confidence,
-              isFinal: result.isFinal,
-              alternatives: result.alternatives,
-            });
-          }
+          // forward both partial and final
+          const r = {
+            transcript: result.alternatives?.[0]?.transcript || '',
+            confidence: result.alternatives?.[0]?.confidence ?? 0.9,
+            isFinal: !!result.isFinal,
+            alternatives: result.alternatives,
+          };
+          callback(r);
         }
         break;
-        
+      }
+
       case 'stt_error':
         console.error('STT error from Kyutai:', message.error);
         break;
-        
+
       case 'tts_result':
-        // Handle streaming TTS results if needed
         break;
-        
+
       case 'tts_error':
         console.error('TTS error from Kyutai:', message.error);
         break;
-        
+
       default:
         console.log('Unknown Kyutai message type:', message.type);
     }
+  }
+
+  private findLocalSessionIdByWS(ws: WebSocket): string | undefined {
+    for (const [sid, w] of this.audioSessions.entries()) {
+      if (w === ws) return sid;
+    }
+    return undefined;
   }
 
   private generateSessionId(): string {

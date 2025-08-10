@@ -30,11 +30,16 @@ const audioStreamManager = new AudioStreamManager();
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    service: 'kyutai-client',
-    timestamp: new Date().toISOString(),
-    demo_mode: process.env.DEMO_MODE === 'true'
+  res.json({
+    success: true,
+    data: {
+      status: 'OK',
+      service: 'kyutai-client',
+      timestamp: new Date().toISOString(),
+      demoMode: process.env.DEMO_MODE === 'true',
+      protocol: process.env.MOSHI_PROTOCOL || 'generic',
+      moshiWsUrl: process.env.MOSHI_WS_URL || null,
+    },
   });
 });
 
@@ -111,10 +116,15 @@ async function startServer() {
     if (process.env.DEMO_MODE === 'true') {
       console.log('🎭 Starting in demo mode with mock responses');
     } else {
-      console.log('🔌 Attempting to connect to Kyutai Moshi services...');
-      await sttClient.connect();
-      await ttsClient.connect();
-      console.log('✅ Connected to Kyutai Moshi services');
+      if (process.env.MOSHI_WS_URL) {
+        console.log(`🔌 Using MOSHI_WS_URL=${process.env.MOSHI_WS_URL} (protocol=${process.env.MOSHI_PROTOCOL || 'generic'})`);
+        console.log('ℹ️ Skipping legacy gRPC STT/TTS connection; WebSocket bridging will be used.');
+      } else {
+        console.log('🔌 Attempting to connect to Kyutai Moshi services (gRPC)...');
+        await sttClient.connect();
+        await ttsClient.connect();
+        console.log('✅ Connected to Kyutai Moshi services');
+      }
     }
     
     server.listen(PORT, () => {

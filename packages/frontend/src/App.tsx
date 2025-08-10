@@ -2,6 +2,9 @@ import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Toaster } from 'react-hot-toast';
+import  BrainsPage  from './pages/Brains';
+import  CallsPage from './pages/Calls';
+import  SettingsPage  from './pages/Settings';
 
 // Providers
 import { AuthProvider, useAuth } from './hooks/useAuth';
@@ -56,39 +59,7 @@ function PublicRoute({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
-// Placeholder components for future pages
-function BrainsPage() {
-  return (
-    <div className="p-6">
-      <div className="text-center py-12">
-        <h1 className="text-2xl font-bold text-gray-900 mb-4">AI Brains Management</h1>
-        <p className="text-gray-600">Coming soon in the next phase...</p>
-      </div>
-    </div>
-  );
-}
 
-function CallsPage() {
-  return (
-    <div className="p-6">
-      <div className="text-center py-12">
-        <h1 className="text-2xl font-bold text-gray-900 mb-4">Call Logs</h1>
-        <p className="text-gray-600">Coming soon in the next phase...</p>
-      </div>
-    </div>
-  );
-}
-
-function SettingsPage() {
-  return (
-    <div className="p-6">
-      <div className="text-center py-12">
-        <h1 className="text-2xl font-bold text-gray-900 mb-4">Settings</h1>
-        <p className="text-gray-600">Coming soon in the next phase...</p>
-      </div>
-    </div>
-  );
-}
 
 function AppRoutes() {
   return (

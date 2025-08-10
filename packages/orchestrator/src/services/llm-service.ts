@@ -26,24 +26,31 @@ export class LLMService {
 
   async initialize(): Promise<void> {
     if (this.demoMode && this.mockResponses) {
-      console.log('🎭 LLM Service running in mock mode');
-      return;
+      console.log('🎭 LLM Service running in mock mode')
+      return
     }
 
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.DEEPSEEK_API_KEY
     if (!apiKey) {
-      throw new Error('OPENAI_API_KEY is required when not in mock mode');
+      throw new Error('OPENAI_API_KEY is required when not in mock mode')
     }
 
-    this.openai = new OpenAI({ apiKey });
-    
+    this.openai = new OpenAI({
+      baseURL: 'https://openrouter.ai/api/v1',
+      apiKey,
+      defaultHeaders: {
+        'HTTP-Referer': process.env.SITE_URL || '',
+        'X-Title': process.env.SITE_NAME || '',
+      },
+    })
+
     try {
       // Test the connection
-      await this.openai.models.list();
-      console.log('✅ OpenAI connection established');
+      await this.openai.models.list()
+      console.log('✅ OpenAI connection established')
     } catch (error) {
-      console.error('❌ Failed to connect to OpenAI:', error);
-      throw error;
+      console.error('❌ Failed to connect to OpenAI:', error)
+      throw error
     }
   }
 

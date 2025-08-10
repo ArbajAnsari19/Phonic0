@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 
 export async function connectDB(): Promise<void> {
   try {
-    const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/phonic0';
+    const mongoUri = process.env.MONGODB_URI || 'mongodb+srv://Arbaj19:Arbaj19@arbaj.k56wb.mongodb.net/';
     
     await mongoose.connect(mongoUri, {
       // Modern mongoose doesn't need these options, but keeping for clarity

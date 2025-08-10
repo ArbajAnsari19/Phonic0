@@ -1,10 +1,16 @@
 import axios from 'axios';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+const AUTH_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+const ORCH_BASE_URL = import.meta.env.VITE_ORCH_URL || 'http://localhost:3004';
 
 // Create axios instance
 export const api = axios.create({
-  baseURL: `${API_BASE_URL}/api`,
+  baseURL: `${AUTH_BASE_URL}/api`,
+  headers: { 'Content-Type': 'application/json' },
+});
+
+export const orch = axios.create({
+  baseURL: `${ORCH_BASE_URL}/api`,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -16,6 +22,17 @@ api.interceptors.request.use(
     const token = localStorage.getItem('phonic0_token');
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  (error) => Promise.reject(error)
+);
+
+orch.interceptors.request.use(
+  (config) => {
+    const token = localStorage.getItem('phonic0_token');
+    if (token) {
+      (config.headers as any).Authorization = `Bearer ${token}`;
     }
     return config;
   },
@@ -100,6 +117,10 @@ export const authApi = {
     const response = await api.get('/auth/profile');
     return response.data;
   },
+  updateProfile: async (data: { name: string }): Promise<{ success: boolean; data: { user: User } }> => {
+    const response = await api.put('/auth/profile', data);
+    return response.data;
+  },
 };
 
 // Brain API
@@ -154,6 +175,33 @@ export const brainApi = {
 
 // Health check
 export const healthCheck = async (): Promise<{ status: string; service: string; timestamp: string }> => {
-  const response = await axios.get(`${API_BASE_URL}/health`);
+  const response = await axios.get(`${AUTH_BASE_URL}/health`);
   return response.data;
+};
+
+// Orchestrator APIs
+export const conversationApi = {
+  getStats: async (): Promise<{ success: boolean; data: any }> => {
+    const res = await orch.get('/conversation/stats');
+    return res.data;
+  },
+  getHistory: async (): Promise<{ success: boolean; data: { conversations: any[]; total: number } }> => {
+    const res = await orch.get('/conversation/history');
+    return res.data;
+  },
+  getMessages: async (conversationId: string): Promise<{ success: boolean; data: any }> => {
+    const res = await orch.get(`/conversation/${conversationId}/messages`);
+    return res.data;
+  },
+};
+
+export const callApi = {
+  getSessions: async (): Promise<{ success: boolean; data: { sessions: any[]; total: number } }> => {
+    const res = await orch.get('/call/sessions');
+    return res.data;
+  },
+  getStats: async (): Promise<{ success: boolean; data: any }> => {
+    const res = await orch.get('/call/stats');
+    return res.data;
+  },
 };

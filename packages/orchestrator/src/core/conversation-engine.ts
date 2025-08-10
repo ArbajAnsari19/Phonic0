@@ -1,8 +1,9 @@
 import WebSocket from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { ConversationManager } from '../services/conversation-manager';
-import { KyutaiIntegration } from '../services/kyutai-integration';
 import { AuthIntegration } from '../services/auth-integration';
+import fs from 'fs';
+import path from 'path';
 
 export interface User {
   id: string;
@@ -14,13 +15,14 @@ export interface ConversationSession {
   id: string;
   user: User;
   ws: WebSocket;
+  token?: string;
   conversationId?: string;
   brainId?: string;
+  brainName?: string;
   isActive: boolean;
   startTime: Date;
   lastActivity: Date;
   state: ConversationState;
-  audioSessionId?: string;
   currentTurn?: ConversationTurn;
 }
 
@@ -57,7 +59,6 @@ export class ConversationEngine {
 
   constructor(
     private conversationManager: ConversationManager,
-    private kyutaiIntegration: KyutaiIntegration,
     private authIntegration: AuthIntegration
   ) {
     this.maxSessionDuration = parseInt(process.env.MAX_CONVERSATION_DURATION || '1800') * 1000; // 30 min default
@@ -67,13 +68,14 @@ export class ConversationEngine {
     setInterval(() => this.cleanupInactiveSessions(), 5 * 60 * 1000);
   }
 
-  async createSession(ws: WebSocket, user: User): Promise<string> {
+  async createSession(ws: WebSocket, user: User, token?: string): Promise<string> {
     const sessionId = uuidv4();
     
     const session: ConversationSession = {
       id: sessionId,
       user,
       ws,
+      token,
       isActive: true,
       startTime: new Date(),
       lastActivity: new Date(),
@@ -113,8 +115,10 @@ export class ConversationEngine {
     session.lastActivity = new Date();
 
     try {
+      console.log('🧭 [Engine] handleMessage', { sessionId, phase: session.state.phase, type: message?.type });
       switch (message.type) {
         case 'start_conversation':
+          console.log('🧠 [Engine] start_conversation', { sessionId, brainId: message.brainId });
           await this.startConversation(sessionId, message.brainId);
           break;
 
@@ -146,7 +150,7 @@ export class ConversationEngine {
           throw new Error(`Unknown message type: ${message.type}`);
       }
     } catch (error) {
-      console.error(`Error handling message for session ${sessionId}:`, error);
+      console.error(`❌ [Engine] Error handling message for session ${sessionId}:`, error);
       
       session.state.phase = 'error';
       this.sendMessage(sessionId, {
@@ -158,42 +162,86 @@ export class ConversationEngine {
   }
 
   private async startConversation(sessionId: string, brainId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error('Session not found');
+    }
+    
+    console.log(`🧠 [Engine] Starting conversation for session ${sessionId} with brain ${brainId}`);
+    console.log(`🧠 [Engine] Session state before:`, {
+      conversationId: session.conversationId,
+      brainId: session.brainId,
+      phase: session.state.phase
+    });
+    
+    try {
+      // Get brain instructions from auth service
+      const brain = await this.authIntegration.getBrainById(brainId, session.user.id, session.token);
+      if (!brain) {
+        console.error('❌ [Engine] Brain not found or unauthorized', { sessionId, brainId, userId: session.user.id });
+        throw new Error('Brain not found or unauthorized');
+      }
+
+      console.log(`🧠 [Engine] Brain found:`, { id: brain.id, name: brain.name });
+
+      // Create conversation in conversation manager
+      const conversationId = await this.conversationManager.createConversation(
+        session.user.id,
+        brainId,
+        brain.instructions
+      );
+
+      console.log(`🧠 [Engine] Conversation created with ID:`, conversationId);
+
+      // Update session
+      session.conversationId = conversationId;
+      session.brainId = brainId;
+      session.brainName = brain.name;
+      session.state.phase = 'idle';
+
+      console.log(`🧠 [Engine] Session updated:`, {
+        conversationId: session.conversationId,
+        brainId: session.brainId,
+        phase: session.state.phase
+      });
+
+      this.sendMessage(sessionId, {
+        type: 'conversation_started',
+        conversationId,
+        brain: {
+          id: brain.id,
+          name: brain.name,
+          instructions: brain.instructions,
+        },
+        timestamp: new Date().toISOString(),
+      });
+
+      // Start with AI greeting if configured
+      if (brain.instructions.includes('greeting') || brain.instructions.includes('introduce')) {
+        await this.generateInitialGreeting(sessionId, brain.instructions);
+      }
+    } catch (error) {
+      console.error(`❌ [Engine] Error in startConversation:`, error);
+      throw error;
+    }
+  }
+
+  private async startListening(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId)!;
     
-    // Get brain instructions from auth service
-    const brain = await this.authIntegration.getBrainById(brainId, session.user.id);
-    if (!brain) {
-      throw new Error('Brain not found or unauthorized');
+    if (session.state.phase !== 'idle') {
+      throw new Error(`Cannot start listening in phase: ${session.state.phase}`);
     }
 
-    // Create conversation in conversation manager
-    const conversationId = await this.conversationManager.createConversation(
-      session.user.id,
-      brainId,
-      brain.instructions
-    );
+    // Mark listening state for Whisper STT
+    session.state.phase = 'listening';
 
-    session.conversationId = conversationId;
-    session.brainId = brainId;
-    session.state.phase = 'idle';
-
-    console.log(`🧠 Started conversation ${conversationId} with brain: ${brain.name}`);
+    console.log(`🎤 Started listening for session: ${sessionId}`);
 
     this.sendMessage(sessionId, {
-      type: 'conversation_started',
-      conversationId,
-      brain: {
-        id: brain.id,
-        name: brain.name,
-        instructions: brain.instructions,
-      },
+      type: 'listening_started',
       timestamp: new Date().toISOString(),
     });
-
-    // Start with AI greeting if configured
-    if (brain.instructions.includes('greeting') || brain.instructions.includes('introduce')) {
-      await this.generateInitialGreeting(sessionId, brain.instructions);
-    }
   }
 
   private async generateInitialGreeting(sessionId: string, instructions: string): Promise<void> {
@@ -219,88 +267,119 @@ export class ConversationEngine {
     }
   }
 
-  private async startListening(sessionId: string): Promise<void> {
-    const session = this.sessions.get(sessionId)!;
-    
-    if (session.state.phase !== 'idle') {
-      throw new Error(`Cannot start listening in phase: ${session.state.phase}`);
-    }
-
-    // Create audio session with Kyutai
-    const audioSessionId = await this.kyutaiIntegration.createAudioSession();
-    session.audioSessionId = audioSessionId;
-    session.state.phase = 'listening';
-
-    // Start STT stream
-    await this.kyutaiIntegration.startSTTStream(audioSessionId, {
-      language: 'en-US',
-      sampleRate: 16000,
-      encoding: 'LINEAR16',
-      interimResults: true,
-      enableVoiceActivityDetection: true,
-    });
-
-    console.log(`🎤 Started listening for session: ${sessionId}`);
-
-    this.sendMessage(sessionId, {
-      type: 'listening_started',
-      audioSessionId,
-      timestamp: new Date().toISOString(),
-    });
-  }
-
   private async processAudioChunk(sessionId: string, audioData: string): Promise<void> {
     const session = this.sessions.get(sessionId)!;
     
-    if (session.state.phase !== 'listening' || !session.audioSessionId) {
+    if (session.state.phase !== 'listening') {
+      console.log(`⚠️ [Engine] Ignoring audio chunk - wrong phase: ${session.state.phase}`);
       return;
     }
 
+    console.log(`🎵 [Engine] Processing audio chunk: ${audioData.length} chars, session: ${sessionId}`);
+    
     const audioBuffer = Buffer.from(audioData, 'base64');
-    await this.kyutaiIntegration.sendAudioChunk(session.audioSessionId, audioBuffer);
+    console.log(`🎵 [Engine] Audio buffer size: ${audioBuffer.length} bytes`);
+    
+    // Buffer chunks for Whisper STT
+    if (!session.currentTurn) {
+      session.currentTurn = {
+        id: uuidv4(),
+        startTime: new Date(),
+        metadata: {},
+      };
+      console.log(`🆕 [Engine] Created new turn: ${session.currentTurn.id}`);
+    }
+    
+    const prev = session.currentTurn.audioInput || Buffer.alloc(0);
+    session.currentTurn.audioInput = Buffer.concat([prev, audioBuffer]);
+    console.log(`📊 [Engine] Total audio buffered: ${session.currentTurn.audioInput.length} bytes`);
   }
 
   private async stopListening(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId)!;
     
-    if (session.state.phase !== 'listening' || !session.audioSessionId) {
-      return;
-    }
+    if (session.state.phase !== 'listening') return;
 
     session.state.phase = 'processing';
-
-    // Get final STT result
-    const sttResult = await this.kyutaiIntegration.stopSTTStream(session.audioSessionId);
     
-    if (sttResult && sttResult.transcript.trim()) {
-      session.state.lastSTTResult = sttResult.transcript;
+    // Use hybrid STT service
+    try {
+      const { HybridSTT } = await import('../services/stt/hybrid-stt');
       
-      console.log(`💬 User said: "${sttResult.transcript}"`);
+      const sttConfig = {
+        primaryProvider: (process.env.STT_PROVIDER as 'python-whisper' | 'openai') || 'python-whisper',
+        fallbackProvider: (process.env.STT_FALLBACK_TO_OPENAI === 'true' ? 'openai' : undefined) as 'python-whisper' | 'openai' | undefined,
+        pythonWhisperConfig: {
+          model: process.env.WHISPER_MODEL || 'base',
+          language: 'en',
+          pythonPath: process.env.PYTHON_PATH || 'python3',
+          device: (process.env.WHISPER_DEVICE as 'cpu' | 'cuda') || 'cpu'
+        },
+        openaiConfig: {
+          model: process.env.WHISPER_MODEL || 'whisper-1',
+          language: 'en',
+          apiKey: process.env.OPENAI_API_KEY
+        }
+      };
 
-      this.sendMessage(sessionId, {
-        type: 'speech_recognized',
-        transcript: sttResult.transcript,
-        confidence: sttResult.confidence,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Process with LLM
-      await this.processTextInput(sessionId, sttResult.transcript);
-    } else {
-      // No speech detected, return to listening
+      const hybridSTT = new HybridSTT(sttConfig);
+      await hybridSTT.initialize();
+      
+      const audio = session.currentTurn?.audioInput;
+      if (audio && audio.length > 0) {
+        const wav = this.encodePCM16ToWav(audio, 16000);
+        const transcript = await hybridSTT.transcribeWavBuffer(wav);
+        
+        session.state.lastSTTResult = transcript;
+        this.sendMessage(sessionId, { 
+          type: 'speech_recognized', 
+          transcript, 
+          timestamp: new Date().toISOString() 
+        });
+        
+        try { 
+          this.saveUserAudio(session, wav); 
+        } catch {}
+        
+        await this.processTextInput(sessionId, transcript);
+      } else {
+        session.state.phase = 'idle';
+        this.sendMessage(sessionId, { 
+          type: 'no_speech_detected', 
+          timestamp: new Date().toISOString() 
+        });
+      }
+    } catch (e) {
       session.state.phase = 'idle';
-      
-      this.sendMessage(sessionId, {
-        type: 'no_speech_detected',
-        timestamp: new Date().toISOString(),
+      this.sendMessage(sessionId, { 
+        type: 'speech_error', 
+        error: e instanceof Error ? e.message : 'STT failed', 
+        timestamp: new Date().toISOString() 
       });
     }
   }
 
   private async processTextInput(sessionId: string, text: string): Promise<void> {
-    const session = this.sessions.get(sessionId)!;
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error('Session not found');
+    }
+    
+    console.log(`📝 [Engine] Processing text input for session ${sessionId}:`, {
+      text: text.substring(0, 50) + (text.length > 50 ? '...' : ''),
+      conversationId: session.conversationId,
+      brainId: session.brainId,
+      phase: session.state.phase
+    });
     
     if (!session.conversationId) {
+      console.error(`❌ [Engine] No active conversation for session ${sessionId}`);
+      console.error(`❌ [Engine] Session state:`, {
+        conversationId: session.conversationId,
+        brainId: session.brainId,
+        phase: session.state.phase,
+        isActive: session.isActive
+      });
       throw new Error('No active conversation');
     }
 
@@ -344,7 +423,7 @@ export class ConversationEngine {
       turn.metadata.processingTime = processingTime;
       session.state.lastLLMResponse = aiResponse;
 
-      console.log(`🤖 AI response: "${aiResponse}"`);
+      console.log(`�� AI response: "${aiResponse}"`);
 
       this.sendMessage(sessionId, {
         type: 'ai_response_generated',
@@ -375,42 +454,38 @@ export class ConversationEngine {
     try {
       const startTime = Date.now();
       
-      // Generate speech using TTS
-      const audioResult = await this.kyutaiIntegration.synthesizeSpeech(text, {
-        voice: {
-          languageCode: 'en-US',
-          name: 'en-US-Standard-A',
-          gender: 'NEUTRAL',
-        },
-        audioConfig: {
-          audioEncoding: 'LINEAR16',
-          sampleRateHertz: 16000,
-          speakingRate: 1.0,
-          pitch: 0.0,
-          volumeGainDb: 0.0,
-        },
-        enableLowLatency: true,
+      // Use Murf TTS
+      const { MurfTTS } = await import('../services/tts/murf-tts');
+      const murf = new MurfTTS({
+        apiKey: process.env.MURF_API_KEY!,
+        voiceId: process.env.MURF_VOICE_ID || 'en-US_Allison',
+        apiUrl: process.env.MURF_API_URL || 'https://api.murf.ai/v1/speech',
       });
+      const audioBuffer = await murf.synthesize(text);
 
       const ttsLatency = Date.now() - startTime;
 
       if (session.currentTurn) {
-        session.currentTurn.audioOutput = audioResult.audioContent;
+        session.currentTurn.audioOutput = audioBuffer;
         session.currentTurn.metadata.ttsLatency = ttsLatency;
         session.currentTurn.endTime = new Date();
       }
 
-      session.state.lastTTSAudio = audioResult.audioContent;
+      session.state.lastTTSAudio = audioBuffer;
 
-      console.log(`🔊 Generated speech (${audioResult.audioContent.length} bytes, ${ttsLatency}ms)`);
+      console.log(`�� Generated speech (${audioBuffer.length} bytes, ${ttsLatency}ms)`);
 
       this.sendMessage(sessionId, {
         type: 'speech_generated',
-        audio: audioResult.audioContent.toString('base64'),
+        audio: audioBuffer.toString('base64'),
         text,
         ttsLatency,
         timestamp: new Date().toISOString(),
       });
+      // Save assistant audio (already WAV)
+      try {
+        this.saveAssistantAudio(session, audioBuffer);
+      } catch (e) { /* ignore */ }
 
       // Return to idle state
       session.state.phase = 'idle';
@@ -432,11 +507,6 @@ export class ConversationEngine {
     
     console.log(`⚡ Interrupt received for session: ${sessionId}`);
 
-    // Stop current TTS if speaking
-    if (session.state.phase === 'speaking' && session.audioSessionId) {
-      await this.kyutaiIntegration.stopTTSStream(session.audioSessionId);
-    }
-
     // Return to listening mode
     session.state.phase = 'idle';
     
@@ -452,11 +522,6 @@ export class ConversationEngine {
     session.state.phase = 'completed';
     session.isActive = false;
 
-    // Clean up audio session
-    if (session.audioSessionId) {
-      await this.kyutaiIntegration.destroyAudioSession(session.audioSessionId);
-    }
-
     // Finalize conversation
     if (session.conversationId) {
       await this.conversationManager.endConversation(session.conversationId);
@@ -464,7 +529,7 @@ export class ConversationEngine {
 
     const duration = Date.now() - session.startTime.getTime();
 
-    console.log(`🏁 Ended conversation ${session.conversationId} (${duration}ms, ${session.state.turnCount} turns)`);
+    console.log(`�� Ended conversation ${session.conversationId} (${duration}ms, ${session.state.turnCount} turns)`);
 
     this.sendMessage(sessionId, {
       type: 'conversation_ended',
@@ -491,7 +556,7 @@ export class ConversationEngine {
     }
 
     this.sessions.delete(sessionId);
-    console.log(`🗑️ Destroyed session: ${sessionId}`);
+    console.log(`��️ Destroyed session: ${sessionId}`);
   }
 
   private sendMessage(sessionId: string, message: any): void {
@@ -548,5 +613,58 @@ export class ConversationEngine {
         ? sessions.reduce((sum, s) => sum + s.state.turnCount, 0) / sessions.length 
         : 0,
     };
+  }
+
+  private ensureRecordingsDir(): string {
+    const dir = process.env.RECORDINGS_DIR || path.resolve(process.cwd(), 'recordings');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  private sanitizeName(s?: string): string {
+    return (s || 'brain').replace(/[^a-z0-9-_]+/gi, '_').slice(0, 60);
+  }
+
+  private saveUserAudio(session: ConversationSession, wavBuffer: Buffer): void {
+    const dir = this.ensureRecordingsDir();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const brain = this.sanitizeName(session.brainName || session.brainId);
+    const filename = `${ts}_${brain}_user.wav`;
+    fs.writeFileSync(path.join(dir, filename), wavBuffer);
+  }
+
+  private saveAssistantAudio(session: ConversationSession, wavBuffer: Buffer): void {
+    const dir = this.ensureRecordingsDir();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const brain = this.sanitizeName(session.brainName || session.brainId);
+    const filename = `${ts}_${brain}_assistant.wav`;
+    fs.writeFileSync(path.join(dir, filename), wavBuffer);
+  }
+
+  // Encode little-endian 16-bit PCM mono @ sampleRate to WAV
+  private encodePCM16ToWav(pcm: Buffer, sampleRate: number = 16000): Buffer {
+    const numChannels = 1;
+    const bitsPerSample = 16;
+    const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+    const blockAlign = (numChannels * bitsPerSample) / 8;
+    const dataSize = pcm.length;
+    const wavSize = 44 + dataSize;
+    const buf = Buffer.alloc(wavSize);
+    let o = 0;
+    buf.write('RIFF', o); o += 4;
+    buf.writeUInt32LE(36 + dataSize, o); o += 4;
+    buf.write('WAVE', o); o += 4;
+    buf.write('fmt ', o); o += 4;
+    buf.writeUInt32LE(16, o); o += 4;               // PCM fmt chunk size
+    buf.writeUInt16LE(1, o); o += 2;                // PCM format
+    buf.writeUInt16LE(numChannels, o); o += 2;
+    buf.writeUInt32LE(sampleRate, o); o += 4;
+    buf.writeUInt32LE(byteRate, o); o += 4;
+    buf.writeUInt16LE(blockAlign, o); o += 2;
+    buf.writeUInt16LE(bitsPerSample, o); o += 2;
+    buf.write('data', o); o += 4;
+    buf.writeUInt32LE(dataSize, o); o += 4;
+    pcm.copy(buf, o);
+    return buf;
   }
 }

@@ -5,10 +5,10 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import WebSocket from 'ws';
 import { createServer } from 'http';
+import net from 'net';
 
 import { ConversationManager } from './services/conversation-manager';
 import { LLMService } from './services/llm-service';
-import { KyutaiIntegration } from './services/kyutai-integration';
 import { AuthIntegration } from './services/auth-integration';
 import { ConversationEngine } from './core/conversation-engine';
 import conversationRoutes from './routes/conversation';
@@ -22,7 +22,7 @@ dotenv.config();
 const app = express();
 const server = createServer(app);
 const PORT = process.env.PORT || 3004;
-
+console.log('🔐 Reached here 0');
 // Security middleware
 app.use(helmet());
 app.use(cors({
@@ -32,6 +32,8 @@ app.use(cors({
   ],
   credentials: true
 }));
+
+console.log('🔐 Reached here 1');
 
 // Rate limiting
 const limiter = rateLimit({
@@ -45,74 +47,141 @@ app.use('/api/', limiter);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+console.log('🔐 Reached here 2');
+
 // Initialize services
 const llmService = new LLMService();
-const kyutaiIntegration = new KyutaiIntegration();
 const authIntegration = new AuthIntegration();
-const conversationManager = new ConversationManager(llmService, kyutaiIntegration);
-const conversationEngine = new ConversationEngine(conversationManager, kyutaiIntegration, authIntegration);
+const conversationManager = new ConversationManager(llmService);
+const conversationEngine = new ConversationEngine(conversationManager, authIntegration);
+console.log('🔐 Reached here 3');
 
 // Routes
 app.use('/api/health', healthRoutes);
 app.use('/api/conversation', authenticateToken, conversationRoutes(conversationManager));
 app.use('/api/call', authenticateToken, callRoutes(conversationEngine));
+console.log('🔐 Reached here 4');
 
-// WebSocket server for real-time call orchestration
-const wss = new WebSocket.Server({ server });
-
-wss.on('connection', async (ws, req) => {
-  console.log('🔌 New orchestrator WebSocket connection');
-  
-  try {
-    // Extract token from query params or headers
-    const url = new URL(req.url || '', `http://${req.headers.host}`);
-    const token = url.searchParams.get('token') || req.headers.authorization?.replace('Bearer ', '');
+// Check if port is available before creating WebSocket server
+console.log('🔐 Checking port availability...');
+const testServer = net.createServer();
+testServer.listen(PORT, () => {
+  console.log(`🔐 Port ${PORT} is available`);
+  testServer.close(() => {
+    console.log('🔐 Port check completed, creating WebSocket server...');
     
-    if (!token) {
-      ws.close(1008, 'Authentication token required');
-      return;
+    try {
+      const wss = new WebSocket.Server({ server });
+      console.log('🔐 WebSocket server created successfully');
+      
+      wss.on('connection', async (ws, req) => {
+        console.log('🔌 [WS] New connection', {
+          url: req.url,
+          ip: (req.socket as any)?.remoteAddress,
+          headers: {
+            origin: req.headers.origin,
+            'sec-websocket-protocol': req.headers['sec-websocket-protocol'],
+            authorization: req.headers.authorization ? 'present' : 'missing',
+          },
+        });
+
+        try {
+          // Extract token from query, subprotocol, or Authorization header
+          const url = new URL(req.url || '', `http://${req.headers.host}`);
+          let token =
+            url.searchParams.get('token') ||
+            (req.headers['sec-websocket-protocol']
+              ? String(req.headers['sec-websocket-protocol'])
+                  .split(',')
+                  .map(s => s.trim())
+                  .find(s => /^Bearer\s+/i.test(s))?.replace(/^Bearer\s+/i, '') ||
+                String(req.headers['sec-websocket-protocol'])
+                  .split(',')
+                  .map(s => s.trim())
+                  .find(s => s.length > 20) // fallback: assume long item is token
+              : undefined) ||
+            req.headers.authorization?.replace(/^[Bb]earer\s+/, '');
+
+          if (!token) {
+            ws.close(1008, 'Authentication token required');
+            console.error('❌ [WS] Close: missing token');
+            return;
+          }
+
+          // Authenticate user
+          const user = await authIntegration.verifyToken(token);
+          if (!user) {
+            ws.close(1008, 'Invalid authentication token');
+            console.error('❌ [WS] Close: invalid token');
+            return;
+          }
+
+          console.log(`👤 [WS] Authenticated user: ${user.email} (${user.id})`);
+
+          // Create conversation session
+          const sessionId = await conversationEngine.createSession(ws, user, token);
+          console.log('🆔 [WS] Session created', { sessionId });
+
+          // Track conversation state
+          let isProcessing = false;
+
+          ws.on('message', async (data) => {
+            try {
+              // Prevent multiple simultaneous processing
+              if (isProcessing) {
+                console.log('⏳ [WS] Already processing, skipping message');
+                return;
+              }
+
+              const message = JSON.parse(data.toString());
+              console.log('📥 [WS] Message received', { sessionId, type: message?.type });
+
+              // Use the existing conversation engine methods
+              await conversationEngine.handleMessage(sessionId, message);
+
+            } catch (error) {
+              console.error('❌ [WS] Message processing error:', error);
+              ws.send(JSON.stringify({
+                type: 'error',
+                message: error instanceof Error ? error.message : 'Unknown error',
+                timestamp: new Date().toISOString()
+              }));
+              isProcessing = false;
+            }
+          });
+
+          ws.on('close', () => {
+            console.log('🔌 [WS] Connection closed', { sessionId });
+            conversationEngine.destroySession(sessionId);
+          });
+
+          ws.on('error', (error) => {
+            console.error('❌ [WS] Error', { sessionId, error });
+            conversationEngine.destroySession(sessionId);
+          });
+
+        } catch (error) {
+          console.error('❌ [WS] Connection error:', error);
+          ws.close(1011, 'Internal server error');
+        }
+      });
+      
+      wss.on('error', (error) => {
+        console.error('❌ WebSocket server error:', error);
+      });
+      
+      console.log('🔐 Reached here 8');
+      
+    } catch (error) {
+      console.error('❌ Failed to create WebSocket server:', error);
+      process.exit(1);
     }
+  });
+});
 
-    // Authenticate user
-    const user = await authIntegration.verifyToken(token);
-    if (!user) {
-      ws.close(1008, 'Invalid authentication token');
-      return;
-    }
-
-    console.log(`👤 Authenticated user: ${user.email}`);
-
-    // Create conversation session
-    const sessionId = await conversationEngine.createSession(ws, user);
-    
-    ws.on('message', async (data) => {
-      try {
-        const message = JSON.parse(data.toString());
-        await conversationEngine.handleMessage(sessionId, message);
-      } catch (error) {
-        console.error('WebSocket message error:', error);
-        ws.send(JSON.stringify({
-          type: 'error',
-          message: error instanceof Error ? error.message : 'Unknown error',
-          timestamp: new Date().toISOString()
-        }));
-      }
-    });
-
-    ws.on('close', () => {
-      console.log('🔌 Orchestrator WebSocket connection closed');
-      conversationEngine.destroySession(sessionId);
-    });
-
-    ws.on('error', (error) => {
-      console.error('WebSocket error:', error);
-      conversationEngine.destroySession(sessionId);
-    });
-
-  } catch (error) {
-    console.error('WebSocket connection error:', error);
-    ws.close(1011, 'Internal server error');
-  }
+testServer.on('error', (error) => {
+  console.error(`❌ Port ${PORT} is already in use:`, error.message);
+  process.exit(1);
 });
 
 // Error handling middleware
@@ -128,6 +197,7 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
     error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
   });
 });
+console.log('🔐 Reached here 9');
 
 // 404 handler
 app.use('*', (req, res) => {
@@ -136,17 +206,15 @@ app.use('*', (req, res) => {
     error: 'Endpoint not found',
   });
 });
-
+console.log('🔐 Reached here 10');
 // Start server
 async function startServer() {
   try {
     // Initialize services
     await llmService.initialize();
-    await kyutaiIntegration.initialize();
-    await authIntegration.initialize();
-    
+    await authIntegration.initialize();    
     console.log('✅ All services initialized');
-
+    console.log('🔐 Reached here 11');
     server.listen(PORT, () => {
       console.log(`🚀 Orchestrator running on port ${PORT}`);
       console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
@@ -155,27 +223,11 @@ async function startServer() {
       console.log(`🔌 WebSocket: ws://localhost:${PORT}`);
       console.log(`🎭 Demo mode: ${process.env.DEMO_MODE === 'true'}`);
     });
+    console.log('🔐 Reached here 12');
   } catch (error) {
     console.error('❌ Failed to start orchestrator:', error);
     process.exit(1);
   }
 }
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('🛑 SIGTERM received, shutting down gracefully');
-  server.close(() => {
-    console.log('✅ Server closed');
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('🛑 SIGINT received, shutting down gracefully');
-  server.close(() => {
-    console.log('✅ Server closed');
-    process.exit(0);
-  });
-});
 
 startServer();

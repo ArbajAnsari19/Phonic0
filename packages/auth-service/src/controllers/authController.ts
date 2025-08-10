@@ -132,3 +132,29 @@ export const getProfile = async (req: Request, res: Response): Promise<void> => 
     });
   }
 };
+
+export const updateProfile = async (req: Request, res: Response): Promise<void> => {
+    try {
+      const userId = (req as any).user._id;
+      const { name } = req.body;
+      const user = await User.findByIdAndUpdate(userId, { name }, { new: true });
+      if (!user) {
+        res.status(404).json({ success: false, error: 'User not found' });
+        return;
+      }
+      res.json({
+        success: true,
+        data: {
+          user: {
+            id: user._id,
+            name: user.name,
+            email: user.email,
+            createdAt: user.createdAt,
+            updatedAt: user.updatedAt,
+          },
+        },
+      });
+    } catch {
+      res.status(500).json({ success: false, error: 'Failed to update profile' });
+    }
+  };

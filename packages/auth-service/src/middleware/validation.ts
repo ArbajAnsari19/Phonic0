@@ -42,3 +42,7 @@ export const brainUpdateSchema = Joi.object({
   description: Joi.string().trim().max(500).optional(),
   isActive: Joi.boolean().optional(),
 }).min(1); // At least one field must be provided for update
+
+export const userUpdateSchema = Joi.object({
+  name: Joi.string().trim().min(2).max(100).required(),
+});

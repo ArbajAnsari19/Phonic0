@@ -1,6 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
 import { LLMService } from './llm-service';
-import { KyutaiIntegration } from './kyutai-integration';
 
 export interface Conversation {
   id: string;
@@ -37,8 +36,7 @@ export class ConversationManager {
   private readonly maxContextLength: number;
 
   constructor(
-    private llmService: LLMService,
-    private kyutaiIntegration: KyutaiIntegration
+    private llmService: LLMService
   ) {
     this.maxContextLength = parseInt(process.env.MAX_CONTEXT_LENGTH || '10');
   }

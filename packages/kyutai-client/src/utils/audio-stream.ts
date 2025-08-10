@@ -2,12 +2,15 @@ import WebSocket from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { KyutaiSTTClient, STTConfig } from '../clients/stt-client';
 import { KyutaiTTSClient, TTSConfig } from '../clients/tts-client';
+import { MoshiWSClient } from '../clients/moshi-ws-client';
 
 interface AudioSession {
   id: string;
   ws: WebSocket;
   sttStream?: NodeJS.ReadWriteStream;
   ttsStream?: NodeJS.ReadWriteStream;
+  moshiSTT?: MoshiWSClient;
+  moshiTTS?: MoshiWSClient;
   isSTTActive: boolean;
   isTTSActive: boolean;
   createdAt: Date;
@@ -43,54 +46,87 @@ export class AudioStreamManager {
     }
 
     try {
-      const sttStream = sttClient.createStreamingRecognition(config);
-      session.sttStream = sttStream;
-      session.isSTTActive = true;
+      const useMoshi = process.env.DEMO_MODE !== 'true' && !!process.env.MOSHI_WS_URL;
+      if (useMoshi) {
+        // Real Moshi WS path
+        const moshi = new MoshiWSClient(process.env.MOSHI_WS_URL as string, { audioMode: 'binary' });
+        await moshi.connect('stt', {
+          onSTTResult: (payload) => {
+            const message = {
+              type: 'stt_result',
+              sessionId,
+              data: {
+                results: [{
+                  alternatives: [{ transcript: payload.transcript, confidence: payload.confidence ?? 0.9 }],
+                  isFinal: !!payload.isFinal,
+                }],
+              },
+              timestamp: new Date().toISOString(),
+            };
+            if (session.ws.readyState === WebSocket.OPEN) {
+              session.ws.send(JSON.stringify(message));
+            }
+          },
+          onError: (err) => {
+            const message = {
+              type: 'stt_error',
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: new Date().toISOString(),
+            };
+            if (session.ws.readyState === WebSocket.OPEN) {
+              session.ws.send(JSON.stringify(message));
+            }
+          },
+        }, { config });
+        session.moshiSTT = moshi;
+        session.isSTTActive = true;
+      } else {
+        // Mock/grpc path
+        const sttStream = sttClient.createStreamingRecognition(config);
+        session.sttStream = sttStream;
+        session.isSTTActive = true;
 
-      // Handle STT results
-      sttStream.on('data', (result) => {
-        const message = {
-          type: 'stt_result',
-          sessionId,
-          data: result,
-          timestamp: new Date().toISOString(),
-        };
+        // Handle STT results
+        sttStream.on('data', (result) => {
+          const message = {
+            type: 'stt_result',
+            sessionId,
+            data: result,
+            timestamp: new Date().toISOString(),
+          };
+          if (session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify(message));
+          }
+        });
 
-        if (session.ws.readyState === WebSocket.OPEN) {
-          session.ws.send(JSON.stringify(message));
-        }
-      });
+        sttStream.on('error', (error) => {
+          console.error('STT stream error:', error);
+          const message = {
+            type: 'stt_error',
+            sessionId,
+            error: error.message,
+            timestamp: new Date().toISOString(),
+          };
+          if (session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify(message));
+          }
+          session.isSTTActive = false;
+        });
 
-      sttStream.on('error', (error) => {
-        console.error('STT stream error:', error);
-        const message = {
-          type: 'stt_error',
-          sessionId,
-          error: error.message,
-          timestamp: new Date().toISOString(),
-        };
-
-        if (session.ws.readyState === WebSocket.OPEN) {
-          session.ws.send(JSON.stringify(message));
-        }
-
-        session.isSTTActive = false;
-      });
-
-      sttStream.on('end', () => {
-        console.log('STT stream ended for session:', sessionId);
-        session.isSTTActive = false;
-        
-        const message = {
-          type: 'stt_ended',
-          sessionId,
-          timestamp: new Date().toISOString(),
-        };
-
-        if (session.ws.readyState === WebSocket.OPEN) {
-          session.ws.send(JSON.stringify(message));
-        }
-      });
+        sttStream.on('end', () => {
+          console.log('STT stream ended for session:', sessionId);
+          session.isSTTActive = false;
+          const message = {
+            type: 'stt_ended',
+            sessionId,
+            timestamp: new Date().toISOString(),
+          };
+          if (session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify(message));
+          }
+        });
+      }
 
       console.log(`🎤 Started STT stream for session: ${sessionId}`);
 
@@ -114,13 +150,15 @@ export class AudioStreamManager {
 
   async processAudioChunk(sessionId: string, audioData: Buffer): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.isSTTActive || !session.sttStream) {
-      return;
-    }
+    if (!session || !session.isSTTActive) return;
 
     try {
-      // Send audio data to STT stream
-      session.sttStream.write(audioData);
+      if (session.moshiSTT) {
+        session.moshiSTT.sendAudioChunk(audioData);
+      } else if (session.sttStream) {
+        // Send audio data to STT stream
+        session.sttStream.write(audioData);
+      }
     } catch (error) {
       console.error('Error processing audio chunk:', error);
       
@@ -139,11 +177,13 @@ export class AudioStreamManager {
 
   async endSTTStream(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.isSTTActive) {
-      return;
-    }
+    if (!session || !session.isSTTActive) return;
 
     try {
+      if (session.moshiSTT) {
+        session.moshiSTT.stop();
+        session.moshiSTT = undefined;
+      }
       if (session.sttStream) {
         session.sttStream.end();
         session.sttStream = undefined;
@@ -167,58 +207,88 @@ export class AudioStreamManager {
     }
 
     try {
-      const ttsStream = ttsClient.createStreamingSynthesis(config);
-      session.ttsStream = ttsStream;
-      session.isTTSActive = true;
-
-      // Handle TTS results
-      ttsStream.on('data', (result) => {
-        const message = {
-          type: 'tts_result',
-          sessionId,
-          data: {
-            audioContent: result.audioContent.toString('base64'),
-            timepoints: result.timepoints,
-            isFinal: result.isFinal,
+      const useMoshi = process.env.DEMO_MODE !== 'true' && !!process.env.MOSHI_WS_URL;
+      if (useMoshi) {
+        const moshi = new MoshiWSClient(process.env.MOSHI_WS_URL as string, { audioMode: 'binary' });
+        await moshi.connect('tts', {
+          onTTSAudio: ({ audioBase64, isFinal, timepoints }) => {
+            const message = {
+              type: 'tts_result',
+              sessionId,
+              data: {
+                audioContent: audioBase64,
+                timepoints,
+                isFinal: !!isFinal,
+              },
+              timestamp: new Date().toISOString(),
+            };
+            if (session.ws.readyState === WebSocket.OPEN) {
+              session.ws.send(JSON.stringify(message));
+            }
           },
-          timestamp: new Date().toISOString(),
-        };
+          onError: (err) => {
+            const message = {
+              type: 'tts_error',
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+              timestamp: new Date().toISOString(),
+            };
+            if (session.ws.readyState === WebSocket.OPEN) {
+              session.ws.send(JSON.stringify(message));
+            }
+          },
+        }, { config });
+        session.moshiTTS = moshi;
+        session.isTTSActive = true;
+      } else {
+        const ttsStream = ttsClient.createStreamingSynthesis(config);
+        session.ttsStream = ttsStream;
+        session.isTTSActive = true;
 
-        if (session.ws.readyState === WebSocket.OPEN) {
-          session.ws.send(JSON.stringify(message));
-        }
-      });
+        // Handle TTS results
+        ttsStream.on('data', (result) => {
+          const message = {
+            type: 'tts_result',
+            sessionId,
+            data: {
+              audioContent: result.audioContent.toString('base64'),
+              timepoints: result.timepoints,
+              isFinal: result.isFinal,
+            },
+            timestamp: new Date().toISOString(),
+          };
+          if (session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify(message));
+          }
+        });
 
-      ttsStream.on('error', (error) => {
-        console.error('TTS stream error:', error);
-        const message = {
-          type: 'tts_error',
-          sessionId,
-          error: error.message,
-          timestamp: new Date().toISOString(),
-        };
+        ttsStream.on('error', (error) => {
+          console.error('TTS stream error:', error);
+          const message = {
+            type: 'tts_error',
+            sessionId,
+            error: error.message,
+            timestamp: new Date().toISOString(),
+          };
+          if (session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify(message));
+          }
+          session.isTTSActive = false;
+        });
 
-        if (session.ws.readyState === WebSocket.OPEN) {
-          session.ws.send(JSON.stringify(message));
-        }
-
-        session.isTTSActive = false;
-      });
-
-      ttsStream.on('end', () => {
-        console.log('TTS stream ended for session:', sessionId);
-        session.isTTSActive = false;
-        
-        const message = {
-          type: 'tts_ended',
-          sessionId,
-          timestamp: new Date().toISOString(),
-        };
-
-        if (session.ws.readyState === WebSocket.OPEN) {
-          session.ws.send(JSON.stringify(message));
-        }
-      });
+        ttsStream.on('end', () => {
+          console.log('TTS stream ended for session:', sessionId);
+          session.isTTSActive = false;
+          const message = {
+            type: 'tts_ended',
+            sessionId,
+            timestamp: new Date().toISOString(),
+          };
+          if (session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(JSON.stringify(message));
+          }
+        });
+      }
 
       console.log(`🔊 Started TTS stream for session: ${sessionId}`);
 
@@ -242,13 +312,15 @@ export class AudioStreamManager {
 
   async synthesizeText(sessionId: string, text: string): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.isTTSActive || !session.ttsStream) {
-      return;
-    }
+    if (!session || !session.isTTSActive) return;
 
     try {
-      // Send text to TTS stream
-      session.ttsStream.write(text);
+      if (session.moshiTTS) {
+        session.moshiTTS.sendText(text);
+      } else if (session.ttsStream) {
+        // Send text to TTS stream
+        session.ttsStream.write(text);
+      }
     } catch (error) {
       console.error('Error synthesizing text:', error);
       
@@ -267,11 +339,13 @@ export class AudioStreamManager {
 
   async endTTSStream(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.isTTSActive) {
-      return;
-    }
+    if (!session || !session.isTTSActive) return;
 
     try {
+      if (session.moshiTTS) {
+        session.moshiTTS.stop();
+        session.moshiTTS = undefined;
+      }
       if (session.ttsStream) {
         session.ttsStream.end();
         session.ttsStream = undefined;
@@ -291,12 +365,14 @@ export class AudioStreamManager {
     }
 
     // Clean up streams
-    if (session.isSTTActive && session.sttStream) {
-      session.sttStream.end();
+    if (session.isSTTActive) {
+      if (session.moshiSTT) session.moshiSTT.stop();
+      if (session.sttStream) session.sttStream.end();
     }
 
-    if (session.isTTSActive && session.ttsStream) {
-      session.ttsStream.end();
+    if (session.isTTSActive) {
+      if (session.moshiTTS) session.moshiTTS.stop();
+      if (session.ttsStream) session.ttsStream.end();
     }
 
     this.sessions.delete(sessionId);

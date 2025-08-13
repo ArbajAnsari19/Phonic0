@@ -50,7 +50,18 @@ app.use(express.urlencoded({ extended: true }));
 console.log('🔐 Reached here 2');
 
 // Initialize services
-const llmService = new LLMService();
+const llmService = new LLMService({
+  provider: 'openai',
+  openaiConfig: {
+    apiKey: process.env.OPENAI_API_KEY || '',
+    model: process.env.OPENAI_MODEL || 'gpt-3.5-turbo',
+  },
+  streamingConfig: {
+    enabled: true,
+    streamDelay: 50,
+    partialThreshold: 2,
+  },
+});
 const authIntegration = new AuthIntegration();
 const conversationManager = new ConversationManager(llmService);
 const conversationEngine = new ConversationEngine(conversationManager, authIntegration);
@@ -61,6 +72,18 @@ app.use('/api/health', healthRoutes);
 app.use('/api/conversation', authenticateToken, conversationRoutes(conversationManager));
 app.use('/api/call', authenticateToken, callRoutes(conversationEngine));
 console.log('🔐 Reached here 4');
+
+// Add these at the top level, before the WebSocket server creation:
+let pendingAudioLength: number | null = null;
+
+// Add the missing function:
+const handleBinaryAudioMessage = async (sessionId: string, audioData: Buffer) => {
+  try {
+    await conversationEngine.handleBinaryAudio(sessionId, audioData);
+  } catch (error) {
+    console.error('Error handling binary audio:', error);
+  }
+};
 
 // Check if port is available before creating WebSocket server
 console.log('🔐 Checking port availability...');
@@ -119,13 +142,14 @@ testServer.listen(PORT, () => {
           console.log(`👤 [WS] Authenticated user: ${user.email} (${user.id})`);
 
           // Create conversation session
-          const sessionId = await conversationEngine.createSession(ws, user, token);
+          let sessionId = await conversationEngine.createSession(ws, user, token);
           console.log('🆔 [WS] Session created', { sessionId });
 
           // Track conversation state
           let isProcessing = false;
+          let pendingAudioLength: number | null = null; // Move here
 
-          ws.on('message', async (data) => {
+          ws.on('message', async (data, isBinary) => {
             try {
               // Prevent multiple simultaneous processing
               if (isProcessing) {
@@ -133,11 +157,27 @@ testServer.listen(PORT, () => {
                 return;
               }
 
-              const message = JSON.parse(data.toString());
-              console.log('📥 [WS] Message received', { sessionId, type: message?.type });
-
-              // Use the existing conversation engine methods
-              await conversationEngine.handleMessage(sessionId, message);
+              if (isBinary) {
+                // Handle binary audio data
+                if (pendingAudioLength !== null && sessionId) {
+                  await handleBinaryAudioMessage(sessionId, Buffer.from(data as ArrayBuffer));
+                  pendingAudioLength = null;
+                }
+              } else {
+                // Handle JSON messages
+                const message = JSON.parse(data.toString());
+                
+                if (message.type === 'audio_input' && message.audioLength) {
+                  // Store audio length for next binary message
+                  pendingAudioLength = message.audioLength;
+                  sessionId = message.sessionId;
+                } else {
+                  // Handle other JSON messages
+                  if (sessionId) {
+                    await conversationEngine.handleMessage(sessionId, message);
+                  }
+                }
+              }
 
             } catch (error) {
               console.error('❌ [WS] Message processing error:', error);

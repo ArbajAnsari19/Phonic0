@@ -1,442 +1,405 @@
-import { useEffect, useRef, useState } from 'react';
-import { MicRecorder, playBase64Wav, int16ToBase64 } from '../lib/audio';
-import { brainApi } from '../lib/api';
-import toast from 'react-hot-toast';
+import React, { useState, useRef, useEffect } from 'react';
+import { useAuth } from '../hooks/useAuth';
+import { useBrains } from '../hooks/useBrains';
+import { Layout } from '../components/Layout';
+import { Loading } from '../components/Loading';
 
-// Remove the duplicate int16ToBase64 function - it's now imported from audio.ts
-
-// Fixed WebSocket URL function
-function wsBaseUrl(): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const host = window.location.hostname;
-  const port = '3004'; // Orchestrator port
-  return `${protocol}//${host}:${port}`;
+interface CallSession {
+  id: string;
+  brainId: string;
+  brainName: string;
+  isActive: boolean;
+  startTime: Date;
+  transcript: string;
+  aiResponse: string;
 }
 
-export default function Calls() {
-  const [brains, setBrains] = useState<any[]>([]);
-  const [selectedBrain, setSelectedBrain] = useState<string>('');
+export const Calls: React.FC = () => {
+  const { user } = useAuth();
+  const token = localStorage.getItem('phonic0_token');
+  const { data: brainsData, isLoading: brainsLoading } = useBrains();
+  const brains = brainsData?.data.brains || [];
+  const [activeCall, setActiveCall] = useState<CallSession | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
-  const [conversationStarted, setConversationStarted] = useState(false);
-  const [transcript, setTranscript] = useState<string>('');
-  const [aiResponse, setAiResponse] = useState<string>('');
-  const [isProcessing, setIsProcessing] = useState(false);
-  
-  // Add this ref to track recording state
-  const isRecordingRef = useRef(false);
+  const [error, setError] = useState<string | null>(null);
   
   const wsRef = useRef<WebSocket | null>(null);
-  const recorderRef = useRef<MicRecorder | null>(null);
-  const audioChunksRef = useRef<Int16Array[]>([]);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
 
+  // WebSocket connection
   useEffect(() => {
-    loadBrains();
-    return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-    };
-  }, []);
-
-  const loadBrains = async () => {
-    try {
-      console.log('🔄 Loading brains...');
-      const response = await brainApi.getAll();
-      console.log('✅ Brains loaded:', response.data.brains);
-      setBrains(response.data.brains);
-    } catch (error) {
-      console.error('❌ Failed to load brains:', error);
-      toast.error('Failed to load AI brains');
+    if (token) {
+      connectWebSocket();
     }
-  };
+    return () => disconnectWebSocket();
+  }, [token]);
 
-  const startCall = async () => {
-    if (!selectedBrain) {
-      toast.error('Please select an AI Brain first');
-      return;
-    }
-
+  const connectWebSocket = () => {
     try {
-      console.log(' Starting call with brain:', selectedBrain);
-      
-      // Fix: Use the correct localStorage key for token
-      const token = localStorage.getItem('phonic0_token');
-      
-      if (!token) {
-        toast.error('Authentication token not found. Please login again.');
-        return;
-      }
-
-      console.log('🔑 Token found, length:', token.length);
-
-      // 1. Start WebSocket connection
-      const wsUrl = `${wsBaseUrl()}?token=${token}`;
-      console.log('🔌 Attempting WebSocket connection to:', wsUrl);
-      
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocket(`ws://localhost:3004?token=${token}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log('✅ WebSocket connected successfully');
+        console.log('🔌 WebSocket connected');
         setIsConnected(true);
-        
-        // Don't send start_conversation here - wait for session_created
-        toast.success('WebSocket connected!');
+        setError(null);
       };
 
       ws.onmessage = (event) => {
-        try {
+        if (event.data instanceof ArrayBuffer) {
+          // Handle binary audio from TTS
+          handleBinaryAudio(event.data);
+        } else {
+          // Handle JSON messages
           const message = JSON.parse(event.data);
-          console.log(' Received WebSocket message:', message);
-          
-          switch (message.type) {
-            case 'session_created':
-              console.log('🎉 Session created successfully:', message.sessionId);
-              
-              // NOW send start_conversation after session is ready
-              console.log('🧠 Sending start_conversation message...');
-              const startMessage = {
-                type: 'start_conversation',
-                brainId: selectedBrain
-              };
-              ws.send(JSON.stringify(startMessage));
-              
-              setConversationStarted(true);
-              toast.success('Call session started!');
-              break;
-              
-            case 'conversation_started':
-              console.log('🎉 Conversation started successfully');
-              setConversationStarted(true);
-              toast.success('Conversation started!');
-              break;
-              
-            case 'listening_started':
-              console.log('👂 AI is now listening...');
-              break;
-              
-            case 'speech_recognized':
-              console.log('🎤 Speech recognized:', message.transcript);
-              setTranscript(message.transcript);
-              break;
-              
-            case 'ai_response_generated':
-              console.log('🤖 AI response generated:', message.response);
-              setAiResponse(message.response);
-              break;
-              
-            case 'speech_generated':
-              console.log('🎵 Speech generated, playing audio...');
-              // Play AI audio response
-              if (message.audio) {
-                playBase64Wav(message.audio);
-              }
-              setIsProcessing(false);
-              break;
-              
-            case 'error':
-              console.error('❌ Server error:', message.message);
-              toast.error(message.message);
-              setIsProcessing(false);
-              break;
-              
-            default:
-              console.log('❓ Unknown message type:', message.type, 'Full message:', message);
-          }
-        } catch (error) {
-          console.error('❌ Error parsing WebSocket message:', error);
+          handleWebSocketMessage(message);
         }
       };
 
       ws.onerror = (error) => {
         console.error('❌ WebSocket error:', error);
-        toast.error('Connection error occurred');
+        setError('WebSocket connection failed');
         setIsConnected(false);
       };
 
-      ws.onclose = (event) => {
-        console.log('🔌 WebSocket closed:', event.code, event.reason);
+      ws.onclose = () => {
+        console.log('🔌 WebSocket disconnected');
         setIsConnected(false);
-        setConversationStarted(false);
-        setIsRecording(false);
-        toast.error('Connection lost unexpectedly');
       };
 
     } catch (error) {
-      console.error('❌ Failed to start call:', error);
-      toast.error('Failed to start call');
+      console.error('❌ Failed to connect WebSocket:', error);
+      setError('Failed to connect to server');
     }
   };
 
-
-const startRecording = () => {
-  console.log('🎤 Starting recording...');
-  
-  if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-    toast.error('WebSocket not connected');
-    return;
-  }
-
-  try {
-    // 1. Tell backend to start listening
-    console.log('📤 Sending start_listening message...');
-    wsRef.current.send(JSON.stringify({
-      type: 'start_listening'
-    }));
-
-    // 2. Create recorder and set callback FIRST
-    recorderRef.current = new MicRecorder();
-    
-    // Set up chunk streaming callback BEFORE starting
-    recorderRef.current.onAudioChunk = (chunk: Int16Array) => {
-      console.log('🎯 [Calls] onAudioChunk callback triggered!', chunk.length, 'samples');
-      // Use ref instead of state variable
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && isRecordingRef.current) {
-        const base64Chunk = int16ToBase64(chunk);
-        wsRef.current.send(JSON.stringify({
-          type: 'audio_chunk',
-          data: base64Chunk
-        }));
-        console.log('📡 Sent audio chunk:', chunk.length, 'samples');
-      } else {
-        console.warn('⚠️ [Calls] Cannot send audio chunk:', {
-          wsReady: wsRef.current?.readyState === WebSocket.OPEN,
-          isRecording: isRecordingRef.current,
-          wsState: wsRef.current?.readyState
-        });
-      }
-    };
-    
-    console.log('🔧 [Calls] Callback set:', !!recorderRef.current.onAudioChunk);
-    
-    // 3. Start recording AFTER setting callback
-    recorderRef.current.start();
-    setIsRecording(true);
-    isRecordingRef.current = true; // Set ref
-    audioChunksRef.current = [];
-    
-    console.log('✅ Recording started successfully');
-    toast.success('Recording started - speak now!');
-  } catch (error) {
-    console.error('❌ Failed to start recording:', error);
-    toast.error('Failed to start recording');
-  }
-};
-
-  const stopRecording = () => {
-    console.log('⏹️ Stopping recording...');
-    
-    if (!recorderRef.current || !isRecording) return;
-
-    try {
-      // 1. Stop local recording
-      recorderRef.current.stop();
-      setIsRecording(false);
-      isRecordingRef.current = false; // Clear ref
-      
-      // 2. Tell backend to stop listening and process audio
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        console.log('📤 Sending stop_listening message...');
-        wsRef.current.send(JSON.stringify({
-          type: 'stop_listening'
-        }));
-        setIsProcessing(true);
-      }
-      
-      console.log('✅ Recording stopped, processing...');
-      toast.success('Processing your speech...');
-    } catch (error) {
-      console.error('❌ Failed to stop recording:', error);
-      toast.error('Failed to stop recording');
-    }
-  };
-
-  const endCall = () => {
-    console.log(' Ending call...');
-    
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'end_conversation'
-      }));
-    }
-    
+  const disconnectWebSocket = () => {
     if (wsRef.current) {
       wsRef.current.close();
+      wsRef.current = null;
     }
-    
-    setConversationStarted(false);
-    setIsRecording(false);
-    setIsConnected(false);
-    setTranscript('');
-    setAiResponse('');
-    setIsProcessing(false);
-    
-    console.log('✅ Call ended successfully');
-    toast.success('Call ended');
   };
 
+  // Handle binary audio from TTS
+  const handleBinaryAudio = (audioData: ArrayBuffer) => {
+    try {
+      // Convert ArrayBuffer to AudioBuffer and play
+      const audioContext = new AudioContext();
+      audioContext.decodeAudioData(audioData).then((audioBuffer) => {
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.start();
+      });
+    } catch (error) {
+      console.error('❌ Error playing audio:', error);
+    }
+  };
+
+  // Handle WebSocket messages
+  const handleWebSocketMessage = (message: any) => {
+    switch (message.type) {
+      case 'conversation_started':
+        console.log('✅ Conversation started:', message.conversationId);
+        break;
+        
+      case 'stt_result':
+        if (message.data?.results?.[0]?.alternatives?.[0]?.transcript) {
+          const transcript = message.data.results[0].alternatives[0].transcript;
+          setActiveCall(prev => prev ? { ...prev, transcript } : null);
+          
+          // If final result, send to LLM
+          if (message.data.results[0].isFinal) {
+            sendToLLM(transcript);
+          }
+        }
+        break;
+        
+      case 'ai_response':
+        setActiveCall(prev => prev ? { ...prev, aiResponse: message.text } : null);
+        break;
+        
+      case 'error':
+        setError(message.error);
+        break;
+        
+      default:
+        console.log('📨 Unknown message type:', message.type);
+    }
+  };
+
+  // Start a call
+  const startCall = async (brainId: string, brainName: string) => {
+    if (!isConnected || !wsRef.current) {
+      setError('Not connected to server');
+      return;
+    }
+
+    try {
+      // Start conversation (unmute.sh style)
+      wsRef.current.send(JSON.stringify({
+        type: 'start_conversation',
+        brainId: brainId
+      }));
+
+      // Start audio recording
+      await startRecording();
+      
+      setActiveCall({
+        id: Date.now().toString(),
+        brainId,
+        brainName,
+        isActive: true,
+        startTime: new Date(),
+        transcript: '',
+        aiResponse: ''
+      });
+
+    } catch (error) {
+      console.error('❌ Error starting call:', error);
+      setError('Failed to start call');
+    }
+  };
+
+  // End a call
+  const endCall = () => {
+    if (activeCall && wsRef.current) {
+      // End conversation (unmute.sh style)
+      wsRef.current.send(JSON.stringify({
+        type: 'end_conversation',
+        reason: 'User ended call'
+      }));
+      
+      stopRecording();
+      setActiveCall(null);
+    }
+  };
+
+  // Start recording
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      streamRef.current = stream;
+      
+      // Create audio context for real-time processing
+      const audioContext = new AudioContext({ sampleRate: 16000 });
+      audioContextRef.current = audioContext;
+      
+      // Create audio source from microphone
+      const source = audioContext.createMediaStreamSource(stream);
+      
+      // Create script processor for real-time audio chunks
+      const processor = audioContext.createScriptProcessor(1024, 1, 1);
+      processorRef.current = processor;
+      
+      // Process audio chunks in real-time
+      processor.onaudioprocess = (event) => {
+        if (!isRecording || !wsRef.current) return;
+        
+        const inputBuffer = event.inputBuffer;
+        const inputData = inputBuffer.getChannelData(0);
+        
+        // Convert float32 to int16 (16-bit PCM)
+        const pcmBuffer = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          pcmBuffer[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+        }
+        
+        // Convert to Buffer and send binary (unmute.sh style)
+        const audioChunk = Buffer.from(pcmBuffer.buffer);
+        
+        // Send audio metadata first
+        wsRef.current.send(JSON.stringify({
+          type: 'audio_input',
+          audioLength: audioChunk.length
+        }));
+        
+        // Send binary audio data immediately after
+        wsRef.current.send(audioChunk);
+      };
+      
+      // Connect audio nodes
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      
+      setIsRecording(true);
+      console.log('🎤 Recording started');
+      
+    } catch (error) {
+      console.error('❌ Failed to start recording:', error);
+      setError('Failed to start recording');
+    }
+  };
+
+  // Stop recording
+  const stopRecording = () => {
+    try {
+      if (processorRef.current) {
+        processorRef.current.disconnect();
+        processorRef.current = null;
+      }
+      
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+      
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+      
+      setIsRecording(false);
+      console.log('🛑 Recording stopped');
+      
+    } catch (error) {
+      console.error('❌ Error stopping recording:', error);
+    }
+  };
+
+  // Send transcript to LLM
+  const sendToLLM = (text: string) => {
+    if (!isConnected || !wsRef.current) return;
+    
+    wsRef.current.send(JSON.stringify({
+      type: 'text_input',
+      text: text
+    }));
+  };
+
+  // Interrupt current processing
+  const interrupt = () => {
+    if (activeCall && wsRef.current) {
+      wsRef.current.send(JSON.stringify({
+        type: 'interrupt'
+      }));
+    }
+  };
+
+  if (brainsLoading) {
+    return <Loading />;
+  }
+
   return (
-    <div className="min-h-screen bg-gray-50">
+    <Layout>
       <div className="max-w-4xl mx-auto p-6">
-        <div className="bg-white rounded-lg shadow-lg p-6">
-          <div className="flex items-center justify-between mb-6">
-            <h1 className="text-3xl font-bold text-gray-900">Call Logs</h1>
-            <div className="flex items-center space-x-3">
-              <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
-              <span className="text-sm text-gray-600">
-                {isConnected ? 'connected' : 'disconnected'}
-              </span>
-            </div>
-          </div>
-
-          {/* Brain Selection */}
-          {!conversationStarted && (
-            <div className="mb-6 p-4 bg-blue-50 rounded-lg">
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Select AI Brain for Call
-              </label>
-              <select
-                value={selectedBrain}
-                onChange={(e) => setSelectedBrain(e.target.value)}
-                className="w-full p-2 border border-gray-300 rounded-md"
-              >
-                <option key="default" value="">Choose a brain...</option>
-                {brains.map((brain) => (
-                  <option key={brain._id} value={brain._id}>
-                    {brain.name}
-                  </option>
-                ))}
-              </select>
-              <button
-                onClick={startCall}
-                disabled={!selectedBrain || isConnected}
-                className="mt-3 px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
-              >
-                Start Call
-              </button>
-            </div>
-          )}
-
-          {/* Call Controls - Show when conversation is started */}
-          {conversationStarted && (
-            <div className="mb-6 p-4 bg-green-50 rounded-lg">
-              <h3 className="text-lg font-semibold text-green-800 mb-4">Call in Progress</h3>
-              <div className="flex items-center justify-center space-x-4">
-                <button
-                  onClick={startRecording}
-                  disabled={isRecording || isProcessing}
-                  className="px-6 py-3 bg-green-600 text-white rounded-full hover:bg-green-700 disabled:opacity-50 flex items-center space-x-2"
-                >
-                  <span>🎤</span>
-                  <span>{isRecording ? 'Recording...' : 'Start Recording'}</span>
-                </button>
-                
-                {isRecording && (
-                  <button
-                    onClick={stopRecording}
-                    className="px-6 py-3 bg-red-600 text-white rounded-full hover:bg-red-700"
-                  >
-                    Stop Recording
-                  </button>
-                )}
-                
-                <button
-                  onClick={endCall}
-                  className="px-6 py-3 bg-gray-600 text-white rounded-full hover:bg-gray-700"
-                >
-                  End Call
-                </button>
-              </div>
-              
-              {/* Status indicators */}
-              <div className="mt-4 flex items-center justify-center space-x-6 text-sm">
-                <div className="flex items-center space-x-2">
-                  <div className={`w-2 h-2 rounded-full ${isRecording ? 'bg-red-500' : 'bg-gray-300'}`}></div>
-                  <span>{isRecording ? 'Recording' : 'Not Recording'}</span>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <div className={`w-2 h-2 rounded-full ${isProcessing ? 'bg-yellow-500' : 'bg-gray-300'}`}></div>
-                  <span>{isProcessing ? 'Processing...' : 'Ready'}</span>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Call History */}
-          <div className="mb-6">
-            <h2 className="text-xl font-semibold text-gray-900 mb-4">Call History</h2>
-            <div className="bg-gray-100 p-4 rounded-lg min-h-[100px]">
-              {!conversationStarted ? (
-                <p className="text-gray-500">No conversations yet.</p>
-              ) : (
-                <div className="space-y-4">
-                  <div className="flex items-start space-x-3">
-                    <div className="w-2 h-2 bg-blue-500 rounded-full mt-2"></div>
-                    <div>
-                      <p className="text-sm text-gray-600">Conversation started with selected brain</p>
-                      <p className="text-xs text-gray-400">Ready to record</p>
-                    </div>
-                  </div>
-                  
-                  {transcript && (
-                    <div className="flex items-start space-x-3">
-                      <div className="w-2 h-2 bg-green-500 rounded-full mt-2"></div>
-                      <div>
-                        <p className="text-sm text-gray-600">You said:</p>
-                        <p className="text-sm font-medium">{transcript}</p>
-                      </div>
-                    </div>
-                  )}
-                  
-                  {aiResponse && (
-                    <div className="flex items-start space-x-3">
-                      <div className="w-2 h-2 bg-purple-500 rounded-full mt-2"></div>
-                      <div>
-                        <p className="text-sm text-gray-600">AI responded:</p>
-                        <p className="text-sm font-medium">{aiResponse}</p>
-                      </div>
-                    </div>
-                  )}
-                  
-                  {isProcessing && (
-                    <div className="flex items-start space-x-3">
-                      <div className="w-2 h-2 bg-yellow-500 rounded-full mt-2"></div>
-                      <div>
-                        <p className="text-sm text-gray-600">Processing...</p>
-                        <p className="text-xs text-gray-400">AI is thinking and generating response</p>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Live Transcript */}
-          <div>
-            <h2 className="text-xl font-semibold text-gray-900 mb-4">Live Transcript</h2>
-            <div className="bg-gray-100 p-4 rounded-lg min-h-[200px]">
-              {!conversationStarted ? (
-                <div className="flex items-center space-x-2 text-gray-500">
-                  <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
-                  <span>Connecting to AI Brain...</span>
-                </div>
-              ) : !isRecording ? (
-                <div className="flex items-center space-x-2 text-green-500">
-                  <div className="w-2 h-2 bg-green-500 rounded-full"></div>
-                  <span>Ready to record - click Start Recording</span>
-                </div>
-              ) : (
-                <div className="flex items-center space-x-2 text-red-500">
-                  <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
-                  <span>Recording... speak now!</span>
-                </div>
-              )}
-            </div>
+        <h1 className="text-3xl font-bold mb-8">📞 AI Calls</h1>
+        
+        {/* Connection Status */}
+        <div className="mb-6 p-4 rounded-lg text-center">
+          <div className={`inline-flex items-center px-4 py-2 rounded-full text-sm font-medium ${
+            isConnected ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+          }`}>
+            <div className={`w-3 h-3 rounded-full mr-2 ${
+              isConnected ? 'bg-green-500' : 'bg-red-500'
+            }`}></div>
+            {isConnected ? 'Connected' : 'Disconnected'}
           </div>
         </div>
+
+        {/* Error Display */}
+        {error && (
+          <div className="mb-6 p-4 bg-red-100 border border-red-400 text-red-700 rounded-lg">
+            ❌ {error}
+          </div>
+        )}
+
+        {/* Active Call */}
+        {activeCall && (
+          <div className="mb-6 p-6 bg-blue-50 rounded-lg">
+            <h2 className="text-xl font-semibold mb-4">
+               Active Call with {activeCall.brainName}
+            </h2>
+            
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+              <div className="p-4 bg-white rounded-lg">
+                <h3 className="font-medium text-blue-900 mb-2"> What you said:</h3>
+                <p className="text-blue-800 min-h-[4rem]">
+                  {activeCall.transcript || 'Start speaking...'}
+                </p>
+              </div>
+              
+              <div className="p-4 bg-white rounded-lg">
+                <h3 className="font-medium text-green-900 mb-2"> AI Response:</h3>
+                <p className="text-green-800 min-h-[4rem]">
+                  {activeCall.aiResponse || 'Waiting for response...'}
+                </p>
+              </div>
+            </div>
+            
+            <div className="flex justify-center space-x-4">
+              <button
+                onClick={interrupt}
+                className="px-6 py-3 bg-yellow-500 hover:bg-yellow-600 text-white rounded-lg font-medium"
+              >
+                ⚡ Interrupt
+              </button>
+              
+              <button
+                onClick={endCall}
+                className="px-6 py-3 bg-red-500 hover:bg-red-600 text-white rounded-lg font-medium"
+              >
+                🛑 End Call
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Available Brains */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {brains.map((brain:any) => (
+            <div key={brain.id} className="p-6 bg-white rounded-lg shadow-lg border">
+              <h3 className="text-xl font-semibold mb-2">{brain.name}</h3>
+              <p className="text-gray-600 mb-4 line-clamp-3">
+                {brain.description || 'No description available'}
+              </p>
+              
+              {activeCall ? (
+                <button
+                  disabled
+                  className="w-full px-4 py-2 bg-gray-300 text-gray-500 rounded-lg cursor-not-allowed"
+                >
+                  📞 Call in Progress
+                </button>
+              ) : (
+                <button
+                  onClick={() => startCall(brain.id, brain.name)}
+                  disabled={!isConnected}
+                  className={`w-full px-4 py-2 rounded-lg font-medium transition-colors ${
+                    isConnected
+                      ? 'bg-blue-500 hover:bg-blue-600 text-white'
+                      : 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                  }`}
+                >
+                  📞 Start Call
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* No Brains Message */}
+        {brains.length === 0 && (
+          <div className="text-center py-12">
+            <p className="text-gray-500 text-lg">
+              No AI brains available. Please create one first.
+            </p>
+          </div>
+        )}
       </div>
-    </div>
+    </Layout>
   );
-}
+};

@@ -2,10 +2,18 @@
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "outDir": "./dist",
-    "rootDir": "./src",
+    "rootDir": "../..", 
+    "baseUrl": ".",
     "resolveJsonModule": true,
-    "allowSyntheticDefaultImports": true
+    "allowSyntheticDefaultImports": true,
+    "paths": {
+      "kyutai-client": ["../kyutai-client/src"],
+      "kyutai-client/*": ["../kyutai-client/src/*"]
+    }
   },
-  "include": ["src/**/*"],
+  "include": [
+    "src/**/*",
+    "../kyutai-client/src/**/*" 
+  ],
   "exclude": ["node_modules", "dist"]
 }

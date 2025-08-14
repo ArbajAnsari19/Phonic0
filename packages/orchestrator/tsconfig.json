@@ -11,9 +11,11 @@
       "kyutai-client/*": ["../kyutai-client/src/*"]
     }
   },
+  "ts-node": {
+    "require": ["tsconfig-paths/register"]
+  },
   "include": [
-    "src/**/*",
-    "../kyutai-client/src/**/*" 
+    "src/**/*"
   ],
   "exclude": ["node_modules", "dist"]
 }

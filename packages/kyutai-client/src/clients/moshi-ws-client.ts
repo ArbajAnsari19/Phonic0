@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 
-export type MoshiMode = 'stt' | 'tts';
+export type MoshiMode = 'api/asr-streaming' | 'api/tts_streaming' ;
 
 export interface MoshiSTTConfig {
   language: string;
@@ -47,12 +47,14 @@ type MoshiProtocol = 'generic' | 'fixed';
 interface MoshiClientOptions {
   protocol?: MoshiProtocol; // 'fixed' for the Colab server provided by user
   audioMode?: 'binary' | 'base64';
+  authToken?: string; // Add this back
 }
 
 export class MoshiWSClient {
   private readonly baseUrl: string;
   private readonly protocol: MoshiProtocol;
   private readonly audioMode: 'binary' | 'base64';
+  private readonly authToken?: string; // Add this back
   private ws?: WebSocket;
   private connected = false;
   private mode: MoshiMode | null = null;
@@ -62,6 +64,7 @@ export class MoshiWSClient {
     this.baseUrl = baseUrl;
     this.protocol = options.protocol || (process.env.MOSHI_PROTOCOL as MoshiProtocol) || 'generic';
     this.audioMode = options.audioMode || 'binary';
+    this.authToken = options.authToken || process.env.KYUTAI_API_KEY; // Use the env var
   }
 
   isConnected(): boolean {
@@ -73,7 +76,15 @@ export class MoshiWSClient {
     this.events = events;
 
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(this.baseUrl);
+      // Add custom authentication header
+      const wsOptions: any = {};
+      if (this.authToken) {
+        wsOptions.headers = {
+          'kyutai-api-key': this.authToken  // Use custom header instead of Authorization
+        };
+      }
+      
+      const ws = new WebSocket(this.baseUrl, wsOptions);
       this.ws = ws;
 
       ws.on('open', () => {
@@ -81,7 +92,7 @@ export class MoshiWSClient {
         // Send init depending on protocol
         try {
           if (this.protocol === 'fixed') {
-            if (mode === 'stt') {
+            if (mode === 'api/asr-streaming') {
               ws.send(JSON.stringify({ type: 'start_conversation', brain_id: startPayload?.config?.brainId || 'default' }));
             }
             // tts mode has no explicit start in fixed protocol
@@ -109,7 +120,7 @@ export class MoshiWSClient {
         let text: string | null = null;
         if (Buffer.isBuffer(data) || data instanceof ArrayBuffer) {
           // For TTS, servers may stream raw audio; map to base64
-          if (this.mode === 'tts') {
+          if (this.mode === 'api/tts_streaming') {
             const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
             this.events.onTTSAudio?.({ audioBase64: buf.toString('base64'), isFinal: false });
           }
@@ -152,7 +163,7 @@ export class MoshiWSClient {
             }
           } else {
             // Generic heuristic
-            if (this.mode === 'stt') {
+            if (this.mode === 'api/asr-streaming') {
               const transcript = msg.transcript || msg.text || msg.partial || msg.result;
               const isFinal = Boolean(msg.is_final ?? msg.final ?? msg.isFinal ?? msg.done);
               const confidence = msg.confidence ?? msg.score ?? undefined;
@@ -160,7 +171,7 @@ export class MoshiWSClient {
                 this.events.onSTTResult?.({ transcript, isFinal, confidence, raw: msg });
               }
             }
-            if (this.mode === 'tts') {
+            if (this.mode === 'api/tts_streaming') {
               const audioB64 = msg.audioBase64 || msg.audio || msg.audio_content || msg.chunk;
               if (audioB64 && typeof audioB64 === 'string') {
                 const isFinal = Boolean(msg.is_final ?? msg.final ?? msg.isFinal ?? msg.done);
@@ -212,7 +223,7 @@ export class MoshiWSClient {
     if (!this.ws) return;
     try {
       if (this.protocol === 'fixed') {
-        if (this.mode === 'stt') {
+        if (this.mode === 'api/asr-streaming') {
           // Send a final marker and then end conversation
           try { this.ws.send(JSON.stringify({ type: 'audio_chunk', audio: '', is_final: true })); } catch {}
           this.ws.send(JSON.stringify({ type: 'end_conversation' }));

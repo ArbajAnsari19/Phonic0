@@ -30,6 +30,9 @@ export const Calls: React.FC = () => {
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
 
+  // Add session tracking
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+
   // WebSocket connection
   useEffect(() => {
     if (token) {
@@ -49,6 +52,7 @@ export const Calls: React.FC = () => {
         setError(null);
       };
 
+      // Update WebSocket message handling
       ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
           // Handle binary audio from TTS
@@ -103,6 +107,12 @@ export const Calls: React.FC = () => {
   // Handle WebSocket messages
   const handleWebSocketMessage = (message: any) => {
     switch (message.type) {
+      case 'session_created':
+        // ✅ CRITICAL: Set the session ID when received
+        setCurrentSessionId(message.sessionId);
+        console.log('✅ Session created:', message.sessionId);
+        break;
+        
       case 'conversation_started':
         console.log('✅ Conversation started:', message.conversationId);
         break;
@@ -207,7 +217,7 @@ export const Calls: React.FC = () => {
       
       // Process audio chunks in real-time
       processor.onaudioprocess = (event) => {
-        if (!isRecording || !wsRef.current) return;
+        if (!isRecording || !wsRef.current || !currentSessionId) return;
         
         const inputBuffer = event.inputBuffer;
         const inputData = inputBuffer.getChannelData(0);
@@ -221,10 +231,11 @@ export const Calls: React.FC = () => {
         // Convert to Buffer and send binary (unmute.sh style)
         const audioChunk = Buffer.from(pcmBuffer.buffer);
         
-        // Send audio metadata first
+        // Send audio metadata with CORRECT session ID
         wsRef.current.send(JSON.stringify({
           type: 'audio_input',
-          audioLength: audioChunk.length
+          audioLength: audioChunk.length,
+          sessionId: currentSessionId // Use actual session ID, not activeCall.id
         }));
         
         // Send binary audio data immediately after

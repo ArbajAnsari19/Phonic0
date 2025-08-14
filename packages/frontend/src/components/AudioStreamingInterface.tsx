@@ -59,13 +59,13 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
     onError: (error) => onError?.(error.message)
   });
 
-  const { isPlaying, isSupported: playbackSupported, playAudioChunk, stopPlayback } = useAudioPlayback({
+  const { isPlaying, isSupported: playbackSupported, playAudioChunk,  } = useAudioPlayback({
     onStart: () => console.log('🔊 Playback started'),
     onStop: () => console.log('🛑 Playback stopped'),
     onError: (error) => onError?.(error.message)
   });
 
-  const { isSpeaking, volume, startMonitoring, stopMonitoring } = useVoiceActivity({
+  const { isSpeaking, volume } = useVoiceActivity({
     onVoiceStart: handleVoiceStart,
     onVoiceEnd: handleVoiceEnd
   });
@@ -79,18 +79,25 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
   // Update WebSocket connection to handle binary:
   const connectWebSocket = () => {
     try {
-      const ws = new WebSocket('ws://localhost:3004');
+      // Get auth token from localStorage
+      const token = localStorage.getItem('phonic0_token');
+      if (!token) {
+        onError?.('Authentication token not found. Please login first.');
+        return;
+      }
+
+      // Connect with token in query params
+      const ws = new WebSocket(`ws://localhost:3004?token=${token}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
         console.log('🔌 WebSocket connected');
         setIsConnected(true);
         
-        // Create session
+        // ✅ Fix: Use correct message type
         ws.send(JSON.stringify({
-          type: 'start_conversation',
-          brainId: 'default',
-          userId: 'user-1'
+          type: 'start_call',  // This is actually correct based on backend
+          brainId: 'default'
         }));
       };
 
@@ -136,9 +143,13 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
   // Update message handling to match unmute.sh protocol
   const handleWebSocketMessage = (message: any) => {
     switch (message.type) {
-      case 'conversation_started':
-        sessionIdRef.current = message.conversationId;
-        console.log('✅ Conversation started:', message.conversationId);
+      case 'session_created':
+        sessionIdRef.current = message.sessionId;
+        console.log('✅ Session created:', message.sessionId);
+        break;
+        
+      case 'call_started':
+        console.log('🚀 Call started:', message.conversationId);
         break;
         
       case 'stt_result':

@@ -3,7 +3,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-d
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Toaster } from 'react-hot-toast';
 import  BrainsPage  from './pages/Brains';
-import  CallsPage from './pages/Calls';
+import  { Calls} from './pages/Calls';
 import  SettingsPage  from './pages/Settings';
 
 // Providers
@@ -103,7 +103,7 @@ function AppRoutes() {
         path="/calls"
         element={
           <ProtectedRoute>
-            <CallsPage />
+            <Calls />
           </ProtectedRoute>
         }
       />

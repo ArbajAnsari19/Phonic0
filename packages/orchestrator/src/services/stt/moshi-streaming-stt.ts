@@ -1,51 +1,76 @@
 import { BaseStreamingSTT, StreamingSTTResult, AudioChunk, StreamingSTTConfig } from './streaming-stt';
-import { KyutaiSTTClient } from 'kyutai-client/clients/stt-client';
+import { MoshiWSClient } from 'kyutai-client/clients/moshi-ws-client'; // Use WebSocket client
 
 export interface MoshiStreamingSTTConfig extends StreamingSTTConfig {
   moshiEndpoint?: string;
   enableInterimResults?: boolean;
   languageCode?: string;
   sampleRate?: number;
+  authToken?: string; // Add this
 }
 
 export class MoshiStreamingSTT extends BaseStreamingSTT {
-  private moshiClient: KyutaiSTTClient;
+  private moshiClient: MoshiWSClient;
   private partialTranscript: string = '';
+  private isConnected: boolean = false;
 
   constructor(config: MoshiStreamingSTTConfig) {
     super({
       ...config,
-      language: config.languageCode || config.language || 'en-US', // Map languageCode to language
+      language: config.languageCode || config.language || 'en-US',
       sampleRate: config.sampleRate || 16000
     });
     
-    this.moshiClient = new KyutaiSTTClient();
+    // Use WebSocket client with your VM endpoints
+    const endpoint = config.moshiEndpoint || process.env.KYUTAI_STT_WS_URL || 'ws://35.244.13.180:8082/api/asr-streaming';
+    this.moshiClient = new MoshiWSClient(endpoint, {
+      protocol: 'fixed',
+      audioMode: 'binary',
+      authToken: config.authToken // Pass the auth token
+    });
   }
 
   async initialize(): Promise<void> {
     try {
-      await this.moshiClient.connect();
-      console.log('✅ Moshi Streaming STT initialized');
+      await this.moshiClient.connect('api/asr-streaming', {
+        onSTTResult: (result) => {
+          console.log('🎤 [STT] WebSocket result received:', result);
+          this.handleSTTResult(result);
+        },
+        onError: (error) => {
+          console.error('❌ [STT] WebSocket error:', error);
+          this.emit('error', error);
+        }
+      });
+      
+      this.isConnected = true;
+      console.log('✅ Moshi WebSocket STT initialized');
     } catch (error) {
-      console.error('❌ Failed to initialize Moshi STT:', error);
+      console.error('❌ Failed to initialize Moshi WebSocket STT:', error);
       throw error;
     }
   }
 
   async processAudioChunk(audioChunk: Buffer): Promise<StreamingSTTResult> {
-    if (!this.isProcessing) {
+    if (!this.isProcessing || !this.isConnected) {
       return this.createEmptyResult();
     }
 
-    // Add chunk to buffer using parent method
-    this.addAudioChunk(audioChunk);
-    
-    // Process accumulated audio (every 500ms worth of audio)
-    if (this.shouldProcessBuffer()) {
-      return await this.processAccumulatedAudio();
-    }
+    try {
+      // Add chunk to buffer using parent method
+      this.addAudioChunk(audioChunk);
+      
+      // Send audio via WebSocket if we have enough data
+      if (this.shouldProcessBuffer()) {
+        await this.sendAudioToMoshi();
+      }
 
-    return this.createEmptyResult();
+      return this.createPartialResult(this.partialTranscript, 0.8, false);
+
+    } catch (error) {
+      console.error('❌ Error processing audio chunk:', error);
+      return this.createEmptyResult();
+    }
   }
 
   async flush(): Promise<StreamingSTTResult> {
@@ -99,34 +124,53 @@ export class MoshiStreamingSTT extends BaseStreamingSTT {
       const audioData = Buffer.concat(this.audioBuffer.map(chunk => chunk.data));
       this.audioBuffer = []; // Clear buffer
 
-      // Send to Moshi for recognition
-      const result = await this.moshiClient.recognize(audioData, {
-        language: this.config.language!, // Use 'language' not 'languageCode'
-        sampleRate: this.config.sampleRate!,
-        encoding: 'LINEAR16',
-        interimResults: true // Use hardcoded value since base class doesn't have this
-      });
+      // Send audio via WebSocket (correct method)
+      this.moshiClient.sendAudioChunk(audioData);
 
-      // Update partial transcript
-      if (result.transcript && result.transcript !== this.partialTranscript) {
-        this.partialTranscript = result.transcript;
-        
-        // Emit partial result
-        const partialResult = this.createPartialResult(result.transcript, result.confidence, result.isFinal);
-        this.emit('partial_result', partialResult);
-        
-        // If final, emit final result
-        if (result.isFinal) {
-          this.emit('final_result', partialResult);
-        }
-      }
-
-      return this.createPartialResult(this.partialTranscript, result.confidence, result.isFinal);
+      // Return partial result - real transcript comes via WebSocket events
+      return this.createPartialResult(this.partialTranscript, 0.8, false);
 
     } catch (error) {
       console.error('❌ Error processing audio with Moshi:', error);
       this.emit('error', error);
       return this.createEmptyResult();
+    }
+  }
+
+  private async sendAudioToMoshi(): Promise<void> {
+    if (this.audioBuffer.length === 0) return;
+
+    try {
+      // Concatenate audio chunks
+      const audioData = Buffer.concat(this.audioBuffer.map(chunk => chunk.data));
+      this.audioBuffer = []; // Clear buffer
+
+      // Send audio via WebSocket (correct method)
+      this.moshiClient.sendAudioChunk(audioData);
+      console.log(` [STT] Sent ${audioData.length} bytes to Moshi WebSocket`);
+
+    } catch (error) {
+      console.error('❌ Error sending audio to Moshi:', error);
+    }
+  }
+
+  private handleSTTResult(result: any): void {
+    if (result.transcript) {
+      this.partialTranscript = result.transcript;
+      
+      // Emit partial result
+      const partialResult = this.createPartialResult(
+        result.transcript, 
+        result.confidence || 0.8, 
+        result.isFinal || false
+      );
+      
+      this.emit('partial_result', partialResult);
+      
+      // If final, emit final result
+      if (result.isFinal) {
+        this.emit('final_result', partialResult);
+      }
     }
   }
 

@@ -109,17 +109,17 @@ export class ConversationManager {
       const context = this.prepareContextForLLM(conversation);
 
       // Get response from LLM
-      const response = await this.llmService.generateResponse(context);
+      const responseContent = await this.llmService.processWithLLM(conversationId, input, role);
       const processingTime = Date.now() - startTime;
 
       // Add assistant response to conversation
       const assistantMessage: ConversationMessage = {
         id: uuidv4(),
         role: 'assistant',
-        content: response.content,
+        content: responseContent,
         timestamp: new Date(),
         metadata: {
-          tokens: response.tokens,
+          tokens: 0, // LLMService doesn't return token count
           processingTime,
         },
       };
@@ -127,7 +127,7 @@ export class ConversationManager {
 
       // Update conversation metadata
       conversation.metadata.turnCount++;
-      conversation.metadata.totalTokens += response.tokens || 0;
+      conversation.metadata.totalTokens += 0; // LLMService doesn't return token count
       conversation.metadata.averageResponseTime = 
         ((conversation.metadata.averageResponseTime * (conversation.metadata.turnCount - 1)) + processingTime) 
         / conversation.metadata.turnCount;
@@ -135,9 +135,9 @@ export class ConversationManager {
       // Trim context if it gets too long
       this.trimConversationContext(conversation);
 
-      console.log(`🤖 LLM response for ${conversationId}: "${response.content}" (${processingTime}ms, ${response.tokens} tokens)`);
+      console.log(`🤖 LLM response for ${conversationId}: "${responseContent}" (${processingTime}ms, 0 tokens)`);
 
-      return response.content;
+      return responseContent;
 
     } catch (error) {
       console.error(`Error processing LLM request for conversation ${conversationId}:`, error);

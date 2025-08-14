@@ -13,7 +13,7 @@ import { AuthIntegration } from './services/auth-integration';
 import { ConversationEngine } from './core/conversation-engine';
 import conversationRoutes from './routes/conversation';
 import callRoutes from './routes/call';
-import healthRoutes from './routes/health';
+import createHealthRouter from './routes/health';
 import { authenticateToken } from './middleware/auth';
 
 // Load environment variables
@@ -65,16 +65,20 @@ const llmService = new LLMService({
 const authIntegration = new AuthIntegration();
 const conversationManager = new ConversationManager(llmService);
 const conversationEngine = new ConversationEngine(conversationManager, authIntegration);
+
+// ✅ CRITICAL: Initialize conversation engine services with await
+ conversationEngine.initializeServices();
+
 console.log('🔐 Reached here 3');
 
 // Routes
-app.use('/api/health', healthRoutes);
+app.use('/api/health', createHealthRouter(conversationEngine));  // Use the factory function
 app.use('/api/conversation', authenticateToken, conversationRoutes(conversationManager));
 app.use('/api/call', authenticateToken, callRoutes(conversationEngine));
 console.log('🔐 Reached here 4');
 
 // Add these at the top level, before the WebSocket server creation:
-let pendingAudioLength: number | null = null;
+// let pendingAudioLength: number | null = null; // Remove this
 
 // Add the missing function:
 const handleBinaryAudioMessage = async (sessionId: string, audioData: Buffer) => {
@@ -109,21 +113,9 @@ testServer.listen(PORT, () => {
         });
 
         try {
-          // Extract token from query, subprotocol, or Authorization header
+          // Extract token from query parameters first (simplified)
           const url = new URL(req.url || '', `http://${req.headers.host}`);
-          let token =
-            url.searchParams.get('token') ||
-            (req.headers['sec-websocket-protocol']
-              ? String(req.headers['sec-websocket-protocol'])
-                  .split(',')
-                  .map(s => s.trim())
-                  .find(s => /^Bearer\s+/i.test(s))?.replace(/^Bearer\s+/i, '') ||
-                String(req.headers['sec-websocket-protocol'])
-                  .split(',')
-                  .map(s => s.trim())
-                  .find(s => s.length > 20) // fallback: assume long item is token
-              : undefined) ||
-            req.headers.authorization?.replace(/^[Bb]earer\s+/, '');
+          let token = url.searchParams.get('token');
 
           if (!token) {
             ws.close(1008, 'Authentication token required');
@@ -145,36 +137,79 @@ testServer.listen(PORT, () => {
           let sessionId = await conversationEngine.createSession(ws, user, token);
           console.log('🆔 [WS] Session created', { sessionId });
 
-          // Track conversation state
+          // Track conversation state per session
           let isProcessing = false;
-          let pendingAudioLength: number | null = null; // Move here
+          // let pendingAudioLength: number | null = null; // Move here
 
+          // Improve WebSocket state management
           ws.on('message', async (data, isBinary) => {
             try {
-              // Prevent multiple simultaneous processing
               if (isProcessing) {
                 console.log('⏳ [WS] Already processing, skipping message');
                 return;
               }
 
               if (isBinary) {
-                // Handle binary audio data
-                if (pendingAudioLength !== null && sessionId) {
-                  await handleBinaryAudioMessage(sessionId, Buffer.from(data as ArrayBuffer));
-                  pendingAudioLength = null;
+                // ✅ CRITICAL: Add proper error handling and session validation
+                if (sessionId) {
+                  try {
+                    await handleBinaryAudioMessage(sessionId, Buffer.from(data as ArrayBuffer));
+                  } catch (audioError) {
+                    console.error('❌ [WS] Audio processing error:', audioError);
+                    ws.send(JSON.stringify({
+                      type: 'error',
+                      message: 'Audio processing failed',
+                      timestamp: new Date().toISOString()
+                    }));
+                  }
+                } else {
+                  console.warn('⚠️ [WS] Received binary data without session ID');
+                  ws.send(JSON.stringify({
+                    type: 'error',
+                    message: 'No active session',
+                    timestamp: new Date().toISOString()
+                  }));
                 }
+                
               } else {
-                // Handle JSON messages
                 const message = JSON.parse(data.toString());
                 
-                if (message.type === 'audio_input' && message.audioLength) {
-                  // Store audio length for next binary message
-                  pendingAudioLength = message.audioLength;
-                  sessionId = message.sessionId;
+                // ✅ Add session validation for all messages
+                if (!sessionId) {
+                  console.warn('⚠️ [WS] Message received without session ID');
+                  ws.send(JSON.stringify({
+                    type: 'error',
+                    message: 'No active session',
+                    timestamp: new Date().toISOString()
+                  }));
+                  return;
+                }
+                
+                if (message.type === 'audio_input' && message.audioLength && message.sessionId) {
+                  // Validate session exists
+                  if (!conversationEngine.hasSession(message.sessionId)) {
+                    console.warn('⚠️ [WS] Invalid session ID:', message.sessionId);
+                    ws.send(JSON.stringify({
+                      type: 'error',
+                      message: 'Invalid session ID',
+                      timestamp: new Date().toISOString()
+                    }));
+                    return;
+                  }
+                  
+                  console.log(`✅ [WS] Audio input prepared for session: ${message.sessionId}, length: ${message.audioLength}`);
+                  
                 } else {
                   // Handle other JSON messages
-                  if (sessionId) {
+                  try {
                     await conversationEngine.handleMessage(sessionId, message);
+                  } catch (messageError) {
+                    console.error('❌ [WS] Message handling error:', messageError);
+                    ws.send(JSON.stringify({
+                      type: 'error',
+                      message: 'Message processing failed',
+                      timestamp: new Date().toISOString()
+                    }));
                   }
                 }
               }
@@ -186,7 +221,6 @@ testServer.listen(PORT, () => {
                 message: error instanceof Error ? error.message : 'Unknown error',
                 timestamp: new Date().toISOString()
               }));
-              isProcessing = false;
             }
           });
 
@@ -252,7 +286,9 @@ async function startServer() {
   try {
     // Initialize services
     await llmService.initialize();
-    await authIntegration.initialize();    
+    await authIntegration.initialize();   
+    await conversationEngine.initializeServices();
+ 
     console.log('✅ All services initialized');
     console.log('🔐 Reached here 11');
     server.listen(PORT, () => {

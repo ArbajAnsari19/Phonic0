@@ -55,7 +55,7 @@ export class KyutaiSTTClient extends EventEmitter {
       });
 
       const sttProto = grpc.loadPackageDefinition(packageDefinition) as any;
-      const endpoint = process.env.KYUTAI_MOSHI_STT_ENDPOINT || 'localhost:50051';
+      const endpoint = process.env.KYUTAI_MOSHI_STT_ENDPOINT || '35.244.13.180:8082';
 
       this.client = new sttProto.moshi.stt.SpeechToText(
         endpoint,

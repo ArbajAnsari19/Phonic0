@@ -30,7 +30,7 @@ export interface ConversationSession {
 }
 
 export interface ConversationState {
-  phase: 'idle' | 'streaming' | 'processing' | 'completed' | 'error';
+  phase: 'idle' | 'ready' | 'streaming' | 'processing' | 'completed' | 'error';
   turnCount: number;
   totalDuration: number;
   streamingData: {
@@ -77,6 +77,9 @@ export class ConversationEngine {
   private streamingSTT: MoshiStreamingSTT | null = null;
   private llmService: LLMService | null = null;
   private ttsService: MoshiStreamingTTS | null = null;
+  private servicesInitialized: boolean = false;
+  private initializationRetries: number = 0;
+  private readonly maxRetries: number = 3;
 
   constructor(
     private conversationManager: ConversationManager,
@@ -85,82 +88,59 @@ export class ConversationEngine {
     this.maxSessionDuration = parseInt(process.env.MAX_CONVERSATION_DURATION || '1800') * 1000;
     this.maxTurnsPerConversation = parseInt(process.env.MAX_TURNS_PER_CONVERSATION || '50');
     
-    this.initializeStreamingSTT();
-    this.initializeLLMService();
-    this.initializeTTSService();
-    
+    // Don't initialize services in constructor
     setInterval(() => this.cleanupInactiveSessions(), 5 * 60 * 1000);
   }
 
-  private async initializeStreamingSTT(): Promise<void> {
-    try {
-      const { MoshiStreamingSTT } = await import('../services/stt');
-      
-      this.streamingSTT = new MoshiStreamingSTT({
-        languageCode: 'en-US',
-        sampleRate: 16000,
-        enableInterimResults: true
-      });
+  // New method for service initialization
+  async initializeServices(): Promise<void> {
+    if (this.servicesInitialized) {
+      console.log('ℹ️ Services already initialized');
+      return;
+    }
 
-      await this.streamingSTT.initialize();
+    try {
+      console.log('🚀 Initializing conversation engine services...');
       
-      this.streamingSTT.on('partial_result', (result) => {
-        this.handlePartialSTTResult(result);
-      });
+      await this.initializeStreamingSTT();
+      await this.initializeLLMService();
+      await this.initializeTTSService();
       
-      this.streamingSTT.on('final_result', (result) => {
-        this.handleFinalSTTResult(result);
-      });
+      this.servicesInitialized = true;
+      this.initializationRetries = 0;
+      console.log('✅ All conversation engine services initialized successfully');
       
-      console.log('✅ Moshi Streaming STT initialized');
     } catch (error) {
-      console.error('❌ Failed to initialize Moshi STT:', error);
+      console.error('❌ Failed to initialize services:', error);
+      this.initializationRetries++;
+      
+      if (this.initializationRetries < this.maxRetries) {
+        console.log(`🔄 Retrying service initialization (${this.initializationRetries}/${this.maxRetries})...`);
+        setTimeout(() => this.initializeServices(), 5000); // Retry after 5 seconds
+      } else {
+        console.error('❌ Max retries exceeded for service initialization');
+        throw new Error('Failed to initialize conversation engine services');
+      }
     }
   }
 
-  private async initializeLLMService(): Promise<void> {
-    try {
-      const { LLMService } = await import('../services/llm-service');
-      
-      this.llmService = new LLMService({
-        provider: 'openai',
-        openaiConfig: {
-          apiKey: process.env.OPENAI_API_KEY || '',
-          model: process.env.OPENAI_MODEL || 'gpt-3.5-turbo',
-        },
-        streamingConfig: {
-          enabled: true,
-          streamDelay: 50,
-          partialThreshold: 2,
-        },
-      });
-
-      await this.llmService.initialize();
-      console.log('✅ Streaming LLM service initialized');
-    } catch (error) {
-      console.error('❌ Failed to initialize LLM service:', error);
-    }
+  // Add health check method
+  async checkServicesHealth(): Promise<{ stt: boolean; llm: boolean; tts: boolean }> {
+    return {
+      stt: this.streamingSTT !== null,
+      llm: this.llmService !== null,
+      tts: this.ttsService !== null
+    };
   }
 
-  private async initializeTTSService(): Promise<void> {
-    try {
-      const { MoshiStreamingTTS } = await import('../services/tts');
-      
-      this.ttsService = new MoshiStreamingTTS({
-        voice: 'en-US',
-        sampleRate: 16000,
-        speakingRate: 1.0,
-        pitch: 1.0
-      });
-
-      await this.ttsService.initialize();
-      console.log('✅ Moshi Streaming TTS service initialized');
-    } catch (error) {
-      console.error('❌ Failed to initialize Moshi TTS service:', error);
-    }
-  }
-
+  // Update session creation to ensure services are ready
   async createSession(ws: WebSocket, user: User, token?: string): Promise<string> {
+    // ✅ CRITICAL: Ensure services are initialized before creating session
+    if (!this.servicesInitialized) {
+      console.log('🔄 Services not initialized, initializing now...');
+      await this.initializeServices();
+    }
+    
     const sessionId = uuidv4();
     
     const session: ConversationSession = {
@@ -202,9 +182,14 @@ export class ConversationEngine {
     if (!session) return;
 
     session.lastActivity = new Date();
+    console.log(` [Message] Received ${message.type} for session: ${sessionId}`);
 
     try {
       switch (message.type) {
+        case 'start_call':
+          await this.startCall(sessionId, message.brainId);
+          break;
+          
         case 'start_conversation':
           await this.startConversation(sessionId, message.brainId);
           break;
@@ -242,13 +227,23 @@ export class ConversationEngine {
       const conversationId = await this.conversationManager.createConversation(
         session.user.id,
         brainId || 'default',
-        'You are a helpful AI assistant.' // Add brain instructions
+        'You are a helpful AI assistant.'
       );
 
       session.conversationId = conversationId;
       session.brainId = brainId;
       session.state.phase = 'idle';
       
+      // ✅ CRITICAL: Send session_created message first
+      this.sendMessage(sessionId, {
+        type: 'session_created',
+        sessionId: sessionId,  // Send the actual session ID
+        conversationId: conversationId,
+        brainId: brainId,
+        timestamp: new Date().toISOString()
+      });
+      
+      // Then send conversation_started
       this.sendMessage(sessionId, {
         type: 'conversation_started',
         conversationId: conversationId,
@@ -548,26 +543,195 @@ export class ConversationEngine {
 
   async handleBinaryAudio(sessionId: string, audioData: Buffer): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !this.streamingSTT) return;
+    if (!session) {
+      console.error(`❌ [Audio] No session found for ID: ${sessionId}`);
+      return;
+    }
 
     try {
-      session.state.phase = 'streaming';
-      session.state.parallelProcessing.sttActive = true;
-      session.state.parallelProcessing.sttStartTime = Date.now();
-
-      // Process binary audio with Moshi STT
-      await this.streamingSTT.processAudioChunk(audioData);
+      console.log(`🎵 [Audio] Received ${audioData.length} bytes for session: ${sessionId}`);
       
-      // Save user audio
-      try {
-        this.saveUserAudio(session, audioData);
-      } catch {}
+      // Ensure STT service is ready
+      if (!this.streamingSTT) {
+        console.error('❌ [Audio] STT service not initialized');
+        return;
+      }
+      
+      // Start STT processing
+      session.state.parallelProcessing.sttActive = true;
+      console.log(`🎤 [STT] Starting transcription for session: ${sessionId}`);
+      
+      // Process audio through STT
+      const sttResult = await this.processAudioWithSTT(sessionId, audioData);
+      
+      if (sttResult && sttResult.transcript) {
+        console.log(`📝 [STT] Transcript: "${sttResult.transcript}" for session: ${sessionId}`);
+        
+        // Process with LLM
+        const llmResponse = await this.processWithLLM(sessionId, sttResult.transcript);
+        
+        if (llmResponse) {
+          console.log(`💬 [LLM] Response: "${llmResponse}" for session: ${sessionId}`);
+          
+          // Process with TTS
+          const ttsResult = await this.processWithTTS(sessionId, llmResponse);
+          
+          if (ttsResult && ttsResult.audio) {
+            console.log(` [TTS] Generated ${ttsResult.audio.length} bytes for session: ${sessionId}`);
+            
+            // Send audio back to client
+            this.sendAudioToClient(sessionId, ttsResult.audio);
+          }
+        }
+      }
+      
+      session.state.parallelProcessing.sttActive = false;
       
     } catch (error) {
-      console.error('❌ Error processing binary audio:', error);
+      console.error(`❌ [Audio] Error processing audio for session ${sessionId}:`, error);
+      session.state.parallelProcessing.sttActive = false;
+      throw error;
+    }
+  }
+
+  // Add this new method for starting a call with proper connections
+  async startCall(sessionId: string, brainId?: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    try {
+      console.log(`🚀 [Call] Starting call for session: ${sessionId}`);
+      
+      // 1. Create conversation
+      const conversationId = await this.conversationManager.createConversation(
+        session.user.id,
+        brainId || 'default',
+        'You are a helpful AI assistant.'
+      );
+      session.conversationId = conversationId;
+      session.brainId = brainId;
+      
+      // 2. Send session_created message FIRST with the actual session ID
+      this.sendMessage(sessionId, {
+        type: 'session_created',
+        sessionId: sessionId,  // Send the actual session ID
+        conversationId: conversationId,
+        brainId: brainId,
+        timestamp: new Date().toISOString()
+      });
+      
+      // 3. Initialize services
+      if (this.streamingSTT) {
+        await this.streamingSTT.initialize();
+      }
+      if (this.ttsService) {
+        await this.ttsService.initialize();
+      }
+      if (this.llmService) {
+        await this.llmService.initialize();
+      }
+      
+      session.state.phase = 'ready';
+      
+      // 4. Send call_started message
+      this.sendMessage(sessionId, {
+        type: 'call_started',
+        conversationId: conversationId,
+        brainId: brainId,
+        timestamp: new Date().toISOString()
+      });
+      
+      console.log(`✅ [Call] Call started successfully: ${conversationId}`);
+      
+    } catch (error) {
+      console.error(`❌ [Call] Failed to start call for session ${sessionId}:`, error);
       session.state.phase = 'error';
       throw error;
     }
+  }
+
+  // Replace these mock functions with real Moshi integration
+  private async processAudioWithSTT(sessionId: string, audioData: Buffer): Promise<any> {
+    try {
+      console.log(`🎤 [STT] Processing ${audioData.length} bytes for session: ${sessionId}`);
+      
+      if (!this.streamingSTT) {
+        throw new Error('STT service not initialized');
+      }
+      
+      // Process audio through real Moshi STT
+      const sttResult = await this.streamingSTT.processAudioChunk(audioData);
+      
+      console.log(`📝 [STT] Real transcript: "${sttResult.transcript}" for session: ${sessionId}`);
+      
+      return {
+        transcript: sttResult.transcript,
+        confidence: sttResult.confidence,
+        isFinal: sttResult.isFinal
+      };
+      
+    } catch (error) {
+      console.error(`❌ [STT] Error processing audio for session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
+  private async processWithLLM(sessionId: string, transcript: string): Promise<string> {
+    try {
+      console.log(`🧠 [LLM] Processing transcript: "${transcript}" for session: ${sessionId}`);
+      
+      if (!this.llmService) {
+        throw new Error('LLM service not initialized');
+      }
+      
+      // Use the correct method: processWithLLM (which returns a string)
+      const response = await this.llmService.processWithLLM(
+        sessionId,        // conversationId
+        transcript,       // input text
+        'user'           // role
+      );
+      
+      console.log(`💬 [LLM] Real response: "${response}" for session: ${sessionId}`);
+      
+      return response;
+      
+    } catch (error) {
+      console.error(`❌ [LLM] Error processing transcript for session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
+  private async processWithTTS(sessionId: string, text: string): Promise<any> {
+    try {
+      console.log(`🔊 [TTS] Converting to speech: "${text}" for session: ${sessionId}`);
+      
+      if (!this.ttsService) {
+        throw new Error('TTS service not initialized');
+      }
+      
+      // Use real Moshi TTS
+      const ttsResult = await this.ttsService.synthesizeText(text);
+      
+      console.log(` [TTS] Generated ${ttsResult.audio.length} bytes of real audio for session: ${sessionId}`);
+      
+      return {
+        audio: ttsResult.audio,
+        text: ttsResult.text,
+        isComplete: ttsResult.isComplete
+      };
+      
+    } catch (error) {
+      console.error(`❌ [TTS] Error converting text to speech for session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
+  private sendAudioToClient(sessionId: string, audioData: Buffer): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.ws.readyState !== WebSocket.OPEN) return;
+    
+    console.log(` [Audio] Sending ${audioData.length} bytes to client for session: ${sessionId}`);
+    session.ws.send(audioData);
   }
 
   // Public methods for monitoring
@@ -600,5 +764,83 @@ export class ConversationEngine {
         ? sessions.reduce((sum, s) => sum + s.state.turnCount, 0) / sessions.length 
         : 0,
     };
+  }
+
+  hasSession(sessionId: string): boolean {
+    return this.sessions.has(sessionId);
+  }
+
+  private async initializeStreamingSTT(): Promise<void> {
+    try {
+      console.log('🎤 Initializing STT service...');
+      
+      // ✅ DIRECT PORT CONNECTION - No path routing
+      this.streamingSTT = new MoshiStreamingSTT({
+        moshiEndpoint: process.env.KYUTAI_STT_WS_URL || 'ws://35.244.13.180:8082/api/asr-streaming',  // Add the path back
+        enableInterimResults: true,
+        languageCode: 'en-US',
+        sampleRate: 16000,
+        authToken: process.env.KYUTAI_API_KEY // Add this
+      });
+      
+      await this.streamingSTT.initialize();
+      console.log('✅ STT service initialized');
+      
+    } catch (error) {
+      console.error('❌ Failed to initialize STT service:', error);
+      throw error;
+    }
+  }
+
+  private async initializeLLMService(): Promise<void> {
+    try {
+      console.log('🧠 Initializing LLM service...');
+      
+      // Create and initialize LLM service
+      this.llmService = new LLMService({
+        provider: 'openai',
+        openaiConfig: {
+          apiKey: process.env.OPENAI_API_KEY || '',
+          model: process.env.OPENAI_MODEL || 'gpt-3.5-turbo'
+        },
+        streamingConfig: {
+          enabled: true,
+          streamDelay: 100,
+          partialThreshold: 3
+        }
+      });
+      
+      await this.llmService.initialize();
+      console.log('✅ LLM service initialized');
+      
+    } catch (error) {
+      console.error('❌ Failed to initialize LLM service:', error);
+      throw error;
+    }
+  }
+
+  private async initializeTTSService(): Promise<void> {
+    try {
+      console.log('🔊 Initializing TTS service...');
+      
+      // ✅ DIRECT PORT CONNECTION - No path routing
+      this.ttsService = new MoshiStreamingTTS({
+        moshiEndpoint: process.env.KYUTAI_TTS_WS_URL || 'ws://35.244.13.180:8083/api/tts_streaming',  // Direct to port 8083
+        audioConfig: {
+          audioEncoding: 'LINEAR16',
+          sampleRateHertz: 16000,
+          speakingRate: 1.0,
+          pitch: 0,
+          volumeGainDb: 0
+        }
+      });
+      
+      await this.ttsService.initialize();
+      console.log('✅ TTS service initialized');
+      
+    } catch (error) {
+      console.error('❌ Failed to initialize TTS service:', error);
+      throw error;
+    }
   }
 }

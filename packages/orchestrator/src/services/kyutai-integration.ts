@@ -76,7 +76,15 @@ export class KyutaiIntegration {
   async createAudioSession(): Promise<string> {
     try {
       const wsUrl = this.baseUrl.replace('http://', 'ws://').replace('https://', 'wss://');
-      const ws = new WebSocket(wsUrl);
+      
+      // Add API key as query parameter for WebSocket connection
+      const wsOptions: any = {};
+      const apiKey = process.env.KYUTAI_API_KEY || 'public_token';
+      wsOptions.headers = {
+        'kyutai-api-key': apiKey
+      };
+
+      const ws = new WebSocket(wsUrl, wsOptions);
 
       return new Promise((resolve, reject) => {
         ws.on('open', () => {

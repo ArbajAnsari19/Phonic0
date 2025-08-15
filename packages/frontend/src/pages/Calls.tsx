@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useAuth } from '../hooks/useAuth';
 import { useBrains } from '../hooks/useBrains';
 import { Layout } from '../components/Layout';
@@ -41,43 +41,69 @@ export const Calls: React.FC = () => {
     return () => disconnectWebSocket();
   }, [token]);
 
+  // ✅ CRITICAL: Add debugging to see when recording state changes
+  useEffect(() => {
+    console.log('🔄 [State] Recording state changed:', isRecording);
+  }, [isRecording]);
+
+  useEffect(() => {
+    console.log('🔄 [State] Current session ID:', currentSessionId);
+  }, [currentSessionId]);
+
   const connectWebSocket = () => {
     try {
+      console.log(' [WS] Attempting to connect to:', `ws://localhost:3004?token=${token ? 'present' : 'missing'}`);
+      
       const ws = new WebSocket(`ws://localhost:3004?token=${token}`);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log('🔌 WebSocket connected');
+        console.log('🔌 [WS] WebSocket connected successfully');
         setIsConnected(true);
         setError(null);
       };
 
       // Update WebSocket message handling
       ws.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          // Handle binary audio from TTS
-          handleBinaryAudio(event.data);
-        } else {
-          // Handle JSON messages
-          const message = JSON.parse(event.data);
-          handleWebSocketMessage(message);
+        try {
+          if (event.data instanceof ArrayBuffer) {
+            // Handle binary audio from TTS
+            handleBinaryAudio(event.data);
+          } else {
+            // Handle JSON messages
+            const message = JSON.parse(event.data);
+            handleWebSocketMessage(message);
+          }
+        } catch (error) {
+          console.error('❌ [WS] Error handling message:', error);
         }
       };
 
       ws.onerror = (error) => {
-        console.error('❌ WebSocket error:', error);
+        // ✅ CRITICAL: Better error logging
+        console.error('❌ [WS] WebSocket error:', error);
+        console.error('❌ [WS] Error details:', {
+          error: error,
+          type: error.type,
+          target: error.target,
+          readyState: ws.readyState
+        });
         setError('WebSocket connection failed');
         setIsConnected(false);
       };
 
-      ws.onclose = () => {
-        console.log('🔌 WebSocket disconnected');
+      ws.onclose = (event) => {
+        console.log('🔌 [WS] WebSocket disconnected:', {
+          code: event.code,
+          reason: event.reason,
+          wasClean: event.wasClean
+        });
         setIsConnected(false);
       };
 
     } catch (error) {
-      console.error('❌ Failed to connect WebSocket:', error);
-      setError('Failed to connect to server');
+      console.error('❌ [WS] Failed to create WebSocket:', error);
+      setError('Failed to create WebSocket connection');
     }
   };
 
@@ -106,6 +132,9 @@ export const Calls: React.FC = () => {
 
   // Handle WebSocket messages
   const handleWebSocketMessage = (message: any) => {
+    // 🆕 ADD THIS: Log ALL messages for debugging
+    console.log('📨 [WS] Received message:', message);
+    
     switch (message.type) {
       case 'session_created':
         // ✅ CRITICAL: Set the session ID when received
@@ -118,46 +147,78 @@ export const Calls: React.FC = () => {
         break;
         
       case 'stt_result':
+        // 🆕 ENHANCED STT logging
+        console.log('🎤 [STT] Result received:', message);
         if (message.data?.results?.[0]?.alternatives?.[0]?.transcript) {
           const transcript = message.data.results[0].alternatives[0].transcript;
+          const isFinal = message.data.results[0].isFinal;
+          console.log(`📝 [STT] Transcript: "${transcript}" (${isFinal ? 'FINAL' : 'PARTIAL'})`);
+          
           setActiveCall(prev => prev ? { ...prev, transcript } : null);
           
-          // If final result, send to LLM
-          if (message.data.results[0].isFinal) {
+          if (isFinal) {
+            console.log('🚀 [STT] Sending final transcript to LLM');
             sendToLLM(transcript);
           }
         }
         break;
         
       case 'ai_response':
+        console.log('🤖 [AI] Response received:', message.text);
         setActiveCall(prev => prev ? { ...prev, aiResponse: message.text } : null);
         break;
         
       case 'error':
+        console.error('❌ [Error] Server error:', message.error);
         setError(message.error);
         break;
         
       default:
-        console.log('📨 Unknown message type:', message.type);
+        console.log('❓ [WS] Unknown message type:', message.type, message);
     }
   };
 
   // Start a call
   const startCall = async (brainId: string, brainName: string) => {
+    console.log('🚀 [Call] Starting call with brain:', { brainId, brainName });
+    
     if (!isConnected || !wsRef.current) {
+      console.error('❌ [Call] Not connected to server');
       setError('Not connected to server');
       return;
     }
 
     try {
-      // Start conversation (unmute.sh style)
+      console.log('📡 [Call] Sending start_conversation message');
+      
+      // Start conversation
       wsRef.current.send(JSON.stringify({
         type: 'start_conversation',
         brainId: brainId
       }));
 
-      // Start audio recording
-      await startRecording();
+      console.log('🎤 [Call] Starting audio recording...');
+      
+      // ✅ CRITICAL: Wait for session ID before starting recording
+      let sessionId = currentSessionId;
+      if (!sessionId) {
+        console.log('⏳ [Call] Waiting for session ID...');
+        let attempts = 0;
+        while (!sessionId && attempts < 50) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          sessionId = currentSessionId;
+          attempts++;
+        }
+        
+        if (!sessionId) {
+          throw new Error('Session ID not available');
+        }
+      }
+      
+      // Start audio recording with session ID
+      await startRecording(sessionId);
+      
+      console.log('📱 [Call] Setting active call state');
       
       setActiveCall({
         id: Date.now().toString(),
@@ -169,8 +230,10 @@ export const Calls: React.FC = () => {
         aiResponse: ''
       });
 
+      console.log('✅ [Call] Call started successfully');
+
     } catch (error) {
-      console.error('❌ Error starting call:', error);
+      console.error('❌ [Call] Error starting call:', error);
       setError('Failed to start call');
     }
   };
@@ -189,9 +252,47 @@ export const Calls: React.FC = () => {
     }
   };
 
-  // Start recording
-  const startRecording = async () => {
+  // ✅ CRITICAL: Create audio callback with proper dependencies
+  const createAudioCallback = useCallback((sessionId: string) => {
+    return (event: AudioProcessingEvent) => {
+      const currentWs = wsRef.current;
+      
+      if (!currentWs || !sessionId) {
+        console.log('⚠️ [Audio] Skipping audio processing:', {
+          wsReady: currentWs?.readyState === WebSocket.OPEN,
+          sessionId: sessionId
+        });
+        return;
+      }
+      
+      const inputBuffer = event.inputBuffer;
+      const inputData = inputBuffer.getChannelData(0);
+      
+      console.log(` [Audio] Processing ${inputData.length} audio samples`);
+      
+      // Convert float32 to int16 (16-bit PCM)
+      const pcmBuffer = new Int16Array(inputData.length);
+      for (let i = 0; i < inputData.length; i++) {
+        pcmBuffer[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+      }
+      
+      // Convert to Buffer and send binary
+      const audioChunk = Buffer.from(pcmBuffer.buffer);
+      
+      console.log(` [Audio] Sending ${audioChunk.length} bytes to server, session: ${sessionId}`);
+      
+      // ✅ CRITICAL: Send ONLY binary audio data, NO metadata
+      currentWs.send(audioChunk);
+      
+      console.log('✅ [Audio] Audio chunk sent successfully');
+    };
+  }, []);
+
+  // Start recording with session ID
+  const startRecording = async (sessionId: string) => {
     try {
+      console.log('🎤 [Recording] Starting audio recording with session:', sessionId);
+      
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           sampleRate: 16000,
@@ -202,11 +303,14 @@ export const Calls: React.FC = () => {
         }
       });
 
+      console.log('✅ [Recording] Microphone access granted');
       streamRef.current = stream;
       
       // Create audio context for real-time processing
       const audioContext = new AudioContext({ sampleRate: 16000 });
       audioContextRef.current = audioContext;
+      
+      console.log('🔧 [Recording] Audio context created');
       
       // Create audio source from microphone
       const source = audioContext.createMediaStreamSource(stream);
@@ -215,12 +319,29 @@ export const Calls: React.FC = () => {
       const processor = audioContext.createScriptProcessor(1024, 1, 1);
       processorRef.current = processor;
       
+      console.log('⚙️ [Recording] Audio processor created');
+      
+      // ✅ CRITICAL: Set recording state FIRST before setting up the callback
+      setIsRecording(true);
+      
+      console.log('🎯 [Recording] Setting up audio callback with session:', sessionId);
+      
       // Process audio chunks in real-time
       processor.onaudioprocess = (event) => {
-        if (!isRecording || !wsRef.current || !currentSessionId) return;
+        const currentWs = wsRef.current;
+        
+        if (!currentWs || !sessionId) {
+          console.log('⚠️ [Audio] Skipping audio processing:', {
+            wsReady: currentWs?.readyState === WebSocket.OPEN,
+            sessionId: sessionId
+          });
+          return;
+        }
         
         const inputBuffer = event.inputBuffer;
         const inputData = inputBuffer.getChannelData(0);
+        
+        console.log(` [Audio] Processing ${inputData.length} audio samples`);
         
         // Convert float32 to int16 (16-bit PCM)
         const pcmBuffer = new Int16Array(inputData.length);
@@ -228,35 +349,34 @@ export const Calls: React.FC = () => {
           pcmBuffer[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
         }
         
-        // Convert to Buffer and send binary (unmute.sh style)
+        // Convert to Buffer and send binary
         const audioChunk = Buffer.from(pcmBuffer.buffer);
         
-        // Send audio metadata with CORRECT session ID
-        wsRef.current.send(JSON.stringify({
-          type: 'audio_input',
-          audioLength: audioChunk.length,
-          sessionId: currentSessionId // Use actual session ID, not activeCall.id
-        }));
+        console.log(` [Audio] Sending ${audioChunk.length} bytes to server, session: ${sessionId}`);
         
-        // Send binary audio data immediately after
-        wsRef.current.send(audioChunk);
+        // ✅ CRITICAL: Send ONLY binary audio data, NO metadata
+        currentWs.send(audioChunk);
+        
+        console.log('✅ [Audio] Audio chunk sent successfully');
       };
       
       // Connect audio nodes
       source.connect(processor);
       processor.connect(audioContext.destination);
       
-      setIsRecording(true);
-      console.log('🎤 Recording started');
+      console.log('🎉 [Recording] Recording started successfully');
       
     } catch (error) {
-      console.error('❌ Failed to start recording:', error);
+      console.error('❌ [Recording] Failed to start recording:', error);
       setError('Failed to start recording');
     }
   };
 
-  // Stop recording
+  // ✅ CRITICAL: Add debugging to see when stopRecording is called
   const stopRecording = () => {
+    console.log('🛑 [Recording] stopRecording called - checking why...');
+    console.trace('🛑 [Recording] Stack trace for stopRecording');
+    
     try {
       if (processorRef.current) {
         processorRef.current.disconnect();
@@ -274,10 +394,10 @@ export const Calls: React.FC = () => {
       }
       
       setIsRecording(false);
-      console.log('🛑 Recording stopped');
+      console.log('🛑 [Recording] Recording stopped');
       
     } catch (error) {
-      console.error('❌ Error stopping recording:', error);
+      console.error('❌ [Recording] Error stopping recording:', error);
     }
   };
 
@@ -297,6 +417,39 @@ export const Calls: React.FC = () => {
       wsRef.current.send(JSON.stringify({
         type: 'interrupt'
       }));
+    }
+  };
+
+  const testAudioCapture = async () => {
+    try {
+      console.log('🧪 [Test] Testing audio capture...');
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      console.log('✅ [Test] Audio stream obtained:', stream);
+      
+      // Test if we can get audio data
+      const audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(1024, 1, 1);
+      
+      processor.onaudioprocess = (event) => {
+        const inputData = event.inputBuffer.getChannelData(0);
+        console.log('🎵 [Test] Audio data received:', inputData.length, 'samples');
+        console.log('🎵 [Test] Sample values:', inputData.slice(0, 5));
+      };
+      
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      
+      // Stop after 3 seconds
+      setTimeout(() => {
+        processor.disconnect();
+        source.disconnect();
+        stream.getTracks().forEach(track => track.stop());
+        console.log('🧪 [Test] Audio test completed');
+      }, 3000);
+      
+    } catch (error) {
+      console.error('❌ [Test] Audio test failed:', error);
     }
   };
 
@@ -371,8 +524,11 @@ export const Calls: React.FC = () => {
 
         {/* Available Brains */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {brains.map((brain:any) => (
-            <div key={brain.id} className="p-6 bg-white rounded-lg shadow-lg border">
+          {brains.map((brain: any, index: number) => (
+            <div 
+              key={brain.id || `brain-${index}`} 
+              className="p-6 bg-white rounded-lg shadow-lg border"
+            >
               <h3 className="text-xl font-semibold mb-2">{brain.name}</h3>
               <p className="text-gray-600 mb-4 line-clamp-3">
                 {brain.description || 'No description available'}
@@ -410,6 +566,13 @@ export const Calls: React.FC = () => {
             </p>
           </div>
         )}
+
+        <button 
+          onClick={testAudioCapture}
+          className="px-4 py-2 bg-yellow-500 text-white rounded-lg mb-4"
+        >
+          🧪 Test Audio Capture
+        </button>
       </div>
     </Layout>
   );

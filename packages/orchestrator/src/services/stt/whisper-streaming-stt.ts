@@ -275,4 +275,18 @@ export class WhisperStreamingSTT extends BaseStreamingSTT {
     
     return buffer;
   }
+
+  isConnected(): boolean {
+    // Since Whisper doesn't maintain a persistent connection,
+    // we'll return true if initialized
+    return this.pythonWhisper !== null || this.openaiWhisper !== null;
+  }
+
+  async connect(): Promise<void> {
+    // For Whisper, connection means initialization
+    // This method is already handled by initialize()
+    if (!this.pythonWhisper && !this.openaiWhisper) {
+      await this.initialize();
+    }
+  }
 }

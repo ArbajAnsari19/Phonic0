@@ -55,7 +55,7 @@ export class KyutaiTTSClient extends EventEmitter {
       });
 
       const ttsProto = grpc.loadPackageDefinition(packageDefinition) as any;
-      const endpoint = process.env.KYUTAI_MOSHI_TTS_ENDPOINT || '35.244.13.180:8083';
+      const endpoint = process.env.KYUTAI_MOSHI_TTS_ENDPOINT || '34.14.197.169:8084';
 
       this.client = new ttsProto.moshi.tts.TextToSpeech(
         endpoint,

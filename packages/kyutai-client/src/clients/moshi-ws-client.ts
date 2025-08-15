@@ -76,11 +76,18 @@ export class MoshiWSClient {
     this.events = events;
 
     return new Promise((resolve, reject) => {
-      // Add custom authentication header
+      // Add connection timeout to prevent hanging
+      const connectionTimeout = setTimeout(() => {
+        reject(new Error(`WebSocket connection timeout to ${this.baseUrl}`));
+      }, 10000); // 10 seconds
+
+      console.log(`🔌 [WS] Attempting connection to: ${this.baseUrl}`);
+      console.log(`🔑 [WS] Using auth token: ${this.authToken}`);
+
       const wsOptions: any = {};
       if (this.authToken) {
         wsOptions.headers = {
-          'kyutai-api-key': this.authToken  // Use custom header instead of Authorization
+          'kyutai-api-key': this.authToken
         };
       }
       
@@ -88,24 +95,34 @@ export class MoshiWSClient {
       this.ws = ws;
 
       ws.on('open', () => {
+        clearTimeout(connectionTimeout);
+        console.log(`✅ [WS] Connected to: ${this.baseUrl}`);
         this.connected = true;
-        // Send init depending on protocol
-        try {
-          if (this.protocol === 'fixed') {
-            if (mode === 'api/asr-streaming') {
-              ws.send(JSON.stringify({ type: 'start_conversation', brain_id: startPayload?.config?.brainId || 'default' }));
-            }
-            // tts mode has no explicit start in fixed protocol
-          } else {
-            if (startPayload) {
-              ws.send(JSON.stringify({ type: `${mode}_start`, ...startPayload }));
-            }
+        
+        // ✅ CRITICAL: Send proper start message for ASR streaming
+        if (mode === 'api/asr-streaming') {
+          try {
+            // ✅ TRY: Simple start message first
+            ws.send(JSON.stringify({ 
+              type: 'start'
+            }));
+            console.log('🚀 [WS] Sent simple start message for ASR streaming');
+          } catch (error) {
+            console.error('❌ [WS] Failed to send start message:', error);
           }
-        } catch {}
+        }
+        
         resolve();
       });
 
       ws.on('message', (data: WebSocket.RawData) => {
+        // ✅ CRITICAL: Log ALL incoming messages for debugging
+        console.log('🔍 [Moshi] Raw message received:', {
+          type: typeof data,
+          size: data instanceof ArrayBuffer ? data.byteLength : data.length,
+          data: typeof data === 'string' ? data : 'binary'
+        });
+        
         // Always forward raw for debugging
         // Normalize raw for callback
         if (typeof data === 'string') {
@@ -133,7 +150,28 @@ export class MoshiWSClient {
 
         try {
           const msg = JSON.parse(text);
+          console.log('🔍 [Moshi] Parsed message:', msg);
           
+          // ✅ CRITICAL: Handle ASR streaming results properly
+          if (this.mode === 'api/asr-streaming') {
+            if (msg.type === 'partial_transcript' || msg.type === 'transcript') {
+              const transcript = msg.transcript || msg.partial_text || msg.text || '';
+              const isFinal = msg.is_final || msg.final || msg.isFinal || false;
+              const confidence = msg.confidence || msg.score || 0.8;
+              
+              if (transcript) {
+                console.log(`🚀 [Moshi] STT Result: "${transcript}" (${isFinal ? 'FINAL' : 'PARTIAL'})`);
+                this.events.onSTTResult?.({ transcript, isFinal, confidence, raw: msg });
+              }
+            } else if (msg.type === 'error') {
+              console.error('❌ [Moshi] Server error:', msg);
+              this.events.onError?.(msg.error || 'Unknown server error');
+            } else if (msg.type === 'ready') {
+              console.log('✅ [Moshi] Server ready for audio processing');
+            }
+          }
+          
+          // Try JSON parse
           if (this.protocol === 'fixed') {
             // Specific handling for the provided Colab server
             switch (msg.type) {
@@ -180,17 +218,25 @@ export class MoshiWSClient {
               }
             }
           }
-        } catch {
-          // not JSON; ignore
+        } catch (error) {
+          console.error('❌ [Moshi] Failed to parse message:', error);
         }
       });
 
       ws.on('error', (err) => {
+        clearTimeout(connectionTimeout);
+        console.error(`❌ [WS] Connection error to ${this.baseUrl}:`, err);
         this.events.onError?.(err as any);
         if (!this.connected) reject(err);
       });
 
-      ws.on('close', () => {
+      ws.on('close', (code, reason) => {
+        clearTimeout(connectionTimeout);
+        console.log(`🔌 [WS] Connection closed to ${this.baseUrl}:`, { 
+          code, 
+          reason: reason.toString(),
+          codeMeaning: this.getCloseCodeMeaning(code)
+        });
         this.connected = false;
       });
     });
@@ -198,9 +244,16 @@ export class MoshiWSClient {
 
   sendAudioChunk(buffer: Buffer): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    if (this.protocol === 'fixed') {
-      // Send JSON with base64 audio
-      this.ws.send(JSON.stringify({ type: 'audio_chunk', audio: buffer.toString('base64'), is_final: false }));
+    
+    console.log(` [Moshi] Sending audio chunk: ${buffer.length} bytes`);
+    
+    // ✅ CRITICAL: Send audio as base64 for ASR streaming
+    if (this.mode === 'api/asr-streaming') {
+      this.ws.send(JSON.stringify({ 
+        type: 'audio_chunk', 
+        audio: buffer.toString('base64'), 
+        is_final: false 
+      }));
     } else {
       if (this.audioMode === 'binary') {
         this.ws.send(buffer);
@@ -221,21 +274,38 @@ export class MoshiWSClient {
 
   stop(): void {
     if (!this.ws) return;
+    
     try {
-      if (this.protocol === 'fixed') {
-        if (this.mode === 'api/asr-streaming') {
-          // Send a final marker and then end conversation
-          try { this.ws.send(JSON.stringify({ type: 'audio_chunk', audio: '', is_final: true })); } catch {}
-          this.ws.send(JSON.stringify({ type: 'end_conversation' }));
-        } else {
-          // no-op for tts
-        }
-      } else {
-        this.ws.send(JSON.stringify({ type: `${this.mode}_end` }));
+      // ✅ CRITICAL: Send proper end message for ASR streaming
+      if (this.mode === 'api/asr-streaming') {
+        this.ws.send(JSON.stringify({ type: 'end' }));
+        console.log('🛑 [Moshi] Sent end message for ASR streaming');
       }
-    } catch {}
+    } catch (error) {
+      console.error('❌ [Moshi] Failed to send end message:', error);
+    }
+    
     this.ws.close();
     this.connected = false;
+  }
+
+  // ✅ CRITICAL: Add close code meanings
+  private getCloseCodeMeaning(code: number): string {
+    switch (code) {
+      case 1000: return 'Normal Closure';
+      case 1001: return 'Going Away';
+      case 1002: return 'Protocol Error';
+      case 1003: return 'Unsupported Data';
+      case 1005: return 'No Status Received';
+      case 1006: return 'Abnormal Closure';
+      case 1007: return 'Invalid frame payload data';
+      case 1008: return 'Policy Violation';
+      case 1009: return 'Message too big';
+      case 1010: return 'Client terminating';
+      case 1011: return 'Server error';
+      case 1015: return 'TLS Handshake';
+      default: return 'Unknown';
+    }
   }
 }
 

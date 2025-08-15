@@ -55,7 +55,7 @@ export class KyutaiSTTClient extends EventEmitter {
       });
 
       const sttProto = grpc.loadPackageDefinition(packageDefinition) as any;
-      const endpoint = process.env.KYUTAI_MOSHI_STT_ENDPOINT || '35.244.13.180:8082';
+      const endpoint = process.env.KYUTAI_MOSHI_STT_ENDPOINT || '34.14.197.169:8082';
 
       this.client = new sttProto.moshi.stt.SpeechToText(
         endpoint,
@@ -113,6 +113,14 @@ export class KyutaiSTTClient extends EventEmitter {
 
     const call = this.client.streamingRecognize();
 
+    // Attach error and data event handlers for robust streaming
+    call.on('error', (error: any) => {
+      this.emit('error', error);
+    });
+    call.on('data', (data: any) => {
+      this.emit('data', data);
+    });
+
     // Send initial configuration
     call.write({
       streamingConfig: {
@@ -123,12 +131,51 @@ export class KyutaiSTTClient extends EventEmitter {
           maxAlternatives: 3,
           enableWordTimeOffsets: true,
         },
-        interimResults: config.interimResults || true,
-        enableVoiceActivityEvents: config.enableVoiceActivityDetection || true,
+        interimResults: typeof config.interimResults !== 'undefined' ? config.interimResults : true,
+        enableVoiceActivityEvents: typeof config.enableVoiceActivityDetection !== 'undefined' ? config.enableVoiceActivityDetection : true,
       },
     });
 
     return call;
+  }
+
+  // New method to stream audio with proper accumulation of chunks for reliable STT processing
+  streamAudioFrom(audioStream: NodeJS.ReadableStream, config: STTConfig): void {
+    if (!this.connected) {
+      throw new Error('STT Client not connected');
+    }
+    // Create the streaming call and attach event handlers
+    const call = this.createStreamingRecognition(config);
+    let bufferAccumulator = Buffer.alloc(0);
+    const threshold = 16384; // send chunk when 16KB accumulated
+
+    // Listen to incoming audio stream data
+    audioStream.on('data', (chunk: Buffer) => {
+      bufferAccumulator = Buffer.concat([bufferAccumulator, chunk]);
+      while (bufferAccumulator.length >= threshold) {
+        const chunkToSend = bufferAccumulator.slice(0, threshold);
+        // Wrap the audio chunk inside an object as expected
+        call.write({ audioContent: chunkToSend } as any);
+        bufferAccumulator = bufferAccumulator.slice(threshold);
+      }
+    });
+
+    // When the audio stream ends, send any remaining data and close the call
+    audioStream.on('end', () => {
+      if (bufferAccumulator.length > 0) {
+        call.write({ audioContent: bufferAccumulator } as any);
+      }
+      call.end();
+      console.log('📨 [STT] Audio stream ended and final data sent');
+    });
+
+    // Forward STT responses as events
+    call.on('data', (data: any) => {
+      this.emit('data', data);
+    });
+    call.on('error', (error: any) => {
+      this.emit('error', error);
+    });
   }
 
   private createMockSTTResult(audioBuffer: Buffer, config: STTConfig): STTResult {

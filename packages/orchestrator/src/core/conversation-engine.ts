@@ -206,6 +206,13 @@ export class ConversationEngine {
           await this.endConversation(sessionId, message.reason);
           break;
           
+        case 'audio_chunk':
+          if (message.audio) {
+            const audioBuffer = Buffer.from(message.audio, 'base64');
+            await this.handleBinaryAudio(sessionId, audioBuffer);
+          }
+          break;
+          
         default:
           console.log(`⚠️ Unknown message type: ${message.type}`);
       }
@@ -449,20 +456,7 @@ export class ConversationEngine {
     }
   }
 
-  // STT Event Handlers
-  private handlePartialSTTResult(result: StreamingSTTResult): void {
-    console.log(`📝 [Engine] Partial STT: ${result.transcript}`);
-    
-    // Find session by STT result (you might need to implement session tracking)
-    // For now, we'll handle this in the main audio processing flow
-  }
 
-  private handleFinalSTTResult(result: StreamingSTTResult): void {
-    console.log(`✅ [Engine] Final STT: ${result.transcript}`);
-    
-    // Process the final transcript
-    // You'll need to implement session tracking for this
-  }
 
   // LLM Event Handlers
   private handleLLMToken(sessionId: string, token: string): void {
@@ -495,6 +489,11 @@ export class ConversationEngine {
       text: completeResponse.text,
       isComplete: true,
       timestamp: new Date().toISOString()
+    });
+    
+    //  ADD THIS: Call TTS after streaming LLM completes
+    this.speakResponse(sessionId, completeResponse.text).catch(error => {
+      console.error('❌ Error in TTS after streaming LLM:', error);
     });
   }
 
@@ -549,43 +548,93 @@ export class ConversationEngine {
     }
 
     try {
-      console.log(`🎵 [Audio] Received ${audioData.length} bytes for session: ${sessionId}`);
+      console.log(`🎵 [Audio] Processing ${audioData.length} bytes for session: ${sessionId}`);
       
-      // Ensure STT service is ready
+      // ✅ CRITICAL: Check if STT service is properly connected
       if (!this.streamingSTT) {
         console.error('❌ [Audio] STT service not initialized');
-        return;
-      }
-      
-      // Start STT processing
-      session.state.parallelProcessing.sttActive = true;
-      console.log(`🎤 [STT] Starting transcription for session: ${sessionId}`);
-      
-      // Process audio through STT
-      const sttResult = await this.processAudioWithSTT(sessionId, audioData);
-      
-      if (sttResult && sttResult.transcript) {
-        console.log(`📝 [STT] Transcript: "${sttResult.transcript}" for session: ${sessionId}`);
-        
-        // Process with LLM
-        const llmResponse = await this.processWithLLM(sessionId, sttResult.transcript);
-        
-        if (llmResponse) {
-          console.log(`💬 [LLM] Response: "${llmResponse}" for session: ${sessionId}`);
-          
-          // Process with TTS
-          const ttsResult = await this.processWithTTS(sessionId, llmResponse);
-          
-          if (ttsResult && ttsResult.audio) {
-            console.log(` [TTS] Generated ${ttsResult.audio.length} bytes for session: ${sessionId}`);
-            
-            // Send audio back to client
-            this.sendAudioToClient(sessionId, ttsResult.audio);
-          }
+        // Try to reinitialize STT service
+        await this.initializeStreamingSTT();
+        if (!this.streamingSTT) {
+          console.error('❌ [Audio] Failed to initialize STT service');
+          return;
         }
       }
       
-      session.state.parallelProcessing.sttActive = false;
+      // ✅ CRITICAL: Check STT service health - use boolean isConnected() when available
+      try {
+        const sttIsConnected = typeof this.streamingSTT.isConnected === 'function'
+          ? this.streamingSTT.isConnected()
+          : this.streamingSTT.getConnectionStatus() === 'connected';
+
+        if (!sttIsConnected) {
+          console.log('🔄 [STT] Service not connected, reconnecting...');
+          try {
+            await this.streamingSTT.connect();
+            console.log('🔁 [STT] Reconnected successfully');
+          } catch (error) {
+            console.error('❌ [STT] Failed to reconnect:', error);
+            return;
+          }
+        }
+      } catch (err) {
+        console.warn('⚠️ [STT] Error checking connection status, attempting reconnect...', err);
+        try { await this.streamingSTT.connect(); } catch (e) { console.error('❌ [STT] Reconnect failed:', e); return; }
+      }
+      
+      // ✅ CRITICAL: Start STT streaming if not already active
+      if (!session.state.parallelProcessing.sttActive) {
+        session.state.parallelProcessing.sttActive = true;
+        console.log(`🎤 [STT] Starting transcription for session: ${sessionId}`);
+        
+        try {
+          await this.streamingSTT.startStreaming();
+          console.log(`✅ [STT] Streaming started for session: ${sessionId}`);
+        } catch (error) {
+          console.error('❌ [STT] Failed to start streaming:', error);
+          session.state.parallelProcessing.sttActive = false;
+          return;
+        }
+      }
+      
+      // ✅ CRITICAL: Process audio through STT
+      try {
+        const sttResult = await this.streamingSTT.processAudioChunk(audioData);
+        
+        if (sttResult && sttResult.transcript) {
+          console.log(`📝 [STT] Result: "${sttResult.transcript}" for session: ${sessionId}`);
+          
+          // ✅ CRITICAL: Process final results with LLM/TTS
+          if (sttResult.isFinal) {
+            console.log(`📝 [STT] Final transcript: "${sttResult.transcript}" for session: ${sessionId}`);
+            
+            // Process with LLM
+            const llmResponse = await this.processWithLLM(sessionId, sttResult.transcript);
+            
+            if (llmResponse) {
+              console.log(`💬 [LLM] Response: "${llmResponse}" for session: ${sessionId}`);
+              
+              // Process with TTS
+              const ttsResult = await this.processWithTTS(sessionId, llmResponse);
+              
+              if (ttsResult && ttsResult.audio) {
+                console.log(` [TTS] Generated ${ttsResult.audio.length} bytes for session: ${sessionId}`);
+                
+                // Send audio back to client
+                this.sendAudioToClient(sessionId, ttsResult.audio);
+              }
+            }
+            
+            // Stop STT streaming after processing
+            await this.streamingSTT.stopStreaming();
+            session.state.parallelProcessing.sttActive = false;
+          }
+        }
+        
+      } catch (sttError) {
+        console.error('❌ [STT] Error processing audio:', sttError);
+        session.state.parallelProcessing.sttActive = false;
+      }
       
     } catch (error) {
       console.error(`❌ [Audio] Error processing audio for session ${sessionId}:`, error);
@@ -651,44 +700,25 @@ export class ConversationEngine {
   }
 
   // Replace these mock functions with real Moshi integration
-  private async processAudioWithSTT(sessionId: string, audioData: Buffer): Promise<any> {
-    try {
-      console.log(`🎤 [STT] Processing ${audioData.length} bytes for session: ${sessionId}`);
-      
-      if (!this.streamingSTT) {
-        throw new Error('STT service not initialized');
-      }
-      
-      // Process audio through real Moshi STT
-      const sttResult = await this.streamingSTT.processAudioChunk(audioData);
-      
-      console.log(`📝 [STT] Real transcript: "${sttResult.transcript}" for session: ${sessionId}`);
-      
-      return {
-        transcript: sttResult.transcript,
-        confidence: sttResult.confidence,
-        isFinal: sttResult.isFinal
-      };
-      
-    } catch (error) {
-      console.error(`❌ [STT] Error processing audio for session ${sessionId}:`, error);
-      throw error;
-    }
-  }
-
   private async processWithLLM(sessionId: string, transcript: string): Promise<string> {
     try {
       console.log(`🧠 [LLM] Processing transcript: "${transcript}" for session: ${sessionId}`);
+      
+      // ✅ CRITICAL: Get the session to access conversationId
+      const session = this.sessions.get(sessionId);
+      if (!session || !session.conversationId) {
+        throw new Error('No active conversation for session');
+      }
       
       if (!this.llmService) {
         throw new Error('LLM service not initialized');
       }
       
-      // Use the correct method: processWithLLM (which returns a string)
+      // ✅ CRITICAL: Use conversationId, not sessionId
       const response = await this.llmService.processWithLLM(
-        sessionId,        // conversationId
-        transcript,       // input text
-        'user'           // role
+        session.conversationId,  // ✅ CORRECT: Use conversationId
+        transcript,              // ✅ CORRECT: User input
+        'user'                  // ✅ CORRECT: Role
       );
       
       console.log(`💬 [LLM] Real response: "${response}" for session: ${sessionId}`);
@@ -774,13 +804,27 @@ export class ConversationEngine {
     try {
       console.log('🎤 Initializing STT service...');
       
-      // ✅ DIRECT PORT CONNECTION - No path routing
       this.streamingSTT = new MoshiStreamingSTT({
-        moshiEndpoint: process.env.KYUTAI_STT_WS_URL || 'ws://35.244.13.180:8082/api/asr-streaming',  // Add the path back
+        moshiEndpoint: process.env.KYUTAI_STT_WS_URL || 'ws://34.14.197.169:8082/api/asr-streaming',
         enableInterimResults: true,
         languageCode: 'en-US',
         sampleRate: 16000,
-        authToken: process.env.KYUTAI_API_KEY // Add this
+        authToken: process.env.KYUTAI_API_KEY || 'public_token'
+      });
+      
+      // ✅ CRITICAL: Add these event listeners for Moshi responses
+      this.streamingSTT.on('partial_result', (result) => {
+        console.log('📝 [STT] Partial result received:', result);
+        this.handlePartialSTTResult(result);
+      });
+      
+      this.streamingSTT.on('final_result', (result) => {
+        console.log('✅ [STT] Final result received:', result);
+        this.handleFinalSTTResult(result);
+      });
+      
+      this.streamingSTT.on('error', (error) => {
+        console.error('❌ [STT] Error:', error);
       });
       
       await this.streamingSTT.initialize();
@@ -789,6 +833,77 @@ export class ConversationEngine {
     } catch (error) {
       console.error('❌ Failed to initialize STT service:', error);
       throw error;
+    }
+  }
+
+  // ✅ CRITICAL: Add these handler methods
+  private handlePartialSTTResult(result: any): void {
+    console.log(`📝 [STT] Partial transcript: "${result.transcript}"`);
+    
+    // Find active session and send partial result to frontend
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (session.state.parallelProcessing.sttActive) {
+        this.sendMessage(sessionId, {
+          type: 'stt_result',
+          data: {
+            results: [{
+              alternatives: [{
+                transcript: result.transcript,
+                confidence: result.confidence || 0.8
+              }],
+              isFinal: false
+            }]
+          },
+          timestamp: new Date().toISOString()
+        });
+        break;
+      }
+    }
+  }
+
+  private handleFinalSTTResult(result: any): void {
+    console.log(`✅ [STT] Final transcript: "${result.transcript}"`);
+    
+    // Find active session and process final result
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (session.state.parallelProcessing.sttActive) {
+        // Send final result to frontend
+        this.sendMessage(sessionId, {
+          type: 'stt_result',
+          data: {
+            results: [{
+              alternatives: [{
+                transcript: result.transcript,
+                confidence: result.confidence || 0.9
+              }],
+              isFinal: true
+            }]
+          },
+          timestamp: new Date().toISOString()
+        });
+        
+        // Process with LLM
+        this.processWithLLM(sessionId, result.transcript).then(llmResponse => {
+          if (llmResponse) {
+            console.log(`💬 [LLM] Response: "${llmResponse}" for session: ${sessionId}`);
+            
+            // Process with TTS
+            this.processWithTTS(sessionId, llmResponse).then(ttsResult => {
+              if (ttsResult && ttsResult.audio) {
+                console.log(` [TTS] Generated ${ttsResult.audio.length} bytes for session: ${sessionId}`);
+                
+                // Send audio back to client
+                this.sendAudioToClient(sessionId, ttsResult.audio);
+              }
+            });
+          }
+        });
+        
+        // Stop STT streaming
+        this.streamingSTT?.stopStreaming();
+        session.state.parallelProcessing.sttActive = false;
+        break;
+      }
     }
   }
 
@@ -823,16 +938,17 @@ export class ConversationEngine {
     try {
       console.log('🔊 Initializing TTS service...');
       
-      // ✅ DIRECT PORT CONNECTION - No path routing
+      // ✅ CRITICAL: Use correct endpoint and configuration
       this.ttsService = new MoshiStreamingTTS({
-        moshiEndpoint: process.env.KYUTAI_TTS_WS_URL || 'ws://35.244.13.180:8083/api/tts_streaming',  // Direct to port 8083
+        moshiEndpoint: process.env.KYUTAI_TTS_WS_URL || 'ws://34.14.197.169:8084/api/tts_streaming',
         audioConfig: {
           audioEncoding: 'LINEAR16',
           sampleRateHertz: 16000,
           speakingRate: 1.0,
           pitch: 0,
           volumeGainDb: 0
-        }
+        },
+        authToken: process.env.KYUTAI_API_KEY || 'public_token'
       });
       
       await this.ttsService.initialize();

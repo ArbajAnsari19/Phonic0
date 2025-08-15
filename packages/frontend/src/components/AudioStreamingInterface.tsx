@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useAudioCapture } from '../hooks/useAudioCapture';
 import { useAudioPlayback } from '../hooks/useAudioPlayback';
 import { useVoiceActivity } from '../hooks/useVoiceActivity';
@@ -21,53 +21,137 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
   
   const wsRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
 
   // Define functions BEFORE using them in hooks
   const handleAudioChunk = (audioChunk: Buffer) => {
-    if (!isConnected || !sessionIdRef.current) return;
-    
-    // Send audio metadata first
-    wsRef.current?.send(JSON.stringify({
-      type: 'audio_input',
+    console.log('🎵 [Frontend] Audio chunk received:', {
+      chunkSize: audioChunk.length,
+      isConnected,
       sessionId: sessionIdRef.current,
-      audioLength: audioChunk.length
-    }));
+      wsReady: wsRef.current?.readyState === WebSocket.OPEN
+    });
     
-    // Send binary audio data immediately after
-    wsRef.current?.send(audioChunk);
+    if (!isConnected || !sessionIdRef.current) {
+      console.log('⚠️ [Frontend] Not connected or no session, skipping audio chunk');
+      return;
+    }
+    
+    // ✅ CRITICAL: Send audio as base64-encoded data in JSON message (like unmute)
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      const message = {
+        type: 'audio_chunk',
+        sessionId: sessionIdRef.current,
+        audio: audioChunk.toString('base64'),
+        timestamp: Date.now()
+      };
+      
+      wsRef.current.send(JSON.stringify(message));
+      console.log('✅ [Frontend] Audio chunk sent as JSON message');
+    } else {
+      console.error('❌ [Frontend] WebSocket not ready');
+    }
   };
 
   const handleVoiceStart = () => {
-    console.log('🎤 Voice detected - starting recording');
-    if (!isRecording) {
+    console.log('🎤 [Frontend] Voice detected - starting recording');
+    console.log(' [Frontend] Current state:', { 
+      isRecording, 
+      isConnected, 
+      sessionId: sessionIdRef.current 
+    });
+    
+    if (!isRecording && isConnected && sessionIdRef.current) {
+      // ✅ CRITICAL: Start recording automatically when voice detected
       startRecording();
+      
+      // ✅ CRITICAL: Send start_listening message to server
+      wsRef.current?.send(JSON.stringify({
+        type: 'start_listening',
+        sessionId: sessionIdRef.current
+      }));
+    } else {
+      console.log('⚠️ [Frontend] Cannot start recording:', { 
+        isRecording, 
+        isConnected, 
+        sessionId: sessionIdRef.current 
+      });
     }
   };
 
   const handleVoiceEnd = () => {
     console.log('🔇 Voice ended - stopping recording');
     if (isRecording) {
+      // ✅ CRITICAL: Stop recording automatically when voice ends
       stopRecording();
+      
+      // ✅ CRITICAL: Send stop_listening message to server
+      wsRef.current?.send(JSON.stringify({
+        type: 'stop_listening',
+        sessionId: sessionIdRef.current
+      }));
     }
   };
 
-  // Now use the hooks with the defined functions
+    // ✅ CRITICAL: Initialize voice activity detection FIRST
+    const { isSpeaking, volume, startMonitoring, stopMonitoring } = useVoiceActivity({
+      onVoiceStart: handleVoiceStart,
+      onVoiceEnd: handleVoiceEnd
+    });
+
+  // ✅ CRITICAL: Get audio stream AFTER voice activity is initialized
+  const getAudioStream = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+      
+      audioStreamRef.current = stream;
+      console.log('🎤 [Frontend] Audio stream obtained');
+      
+      // ✅ CRITICAL: Start voice monitoring immediately with the stream
+      startMonitoring(stream);
+      
+      return stream;
+    } catch (error) {
+      console.error('❌ [Frontend] Failed to get audio stream:', error);
+      onError?.('Failed to access microphone');
+      return null;
+    }
+  }, [onError, startMonitoring]);
+
+
+
+  // ✅ CRITICAL: Modified audio capture to use shared stream
   const { isRecording, isSupported: captureSupported, startRecording, stopRecording } = useAudioCapture({
     onAudioChunk: handleAudioChunk,
-    onStart: () => console.log('🎤 Recording started'),
-    onStop: () => console.log('🛑 Recording stopped'),
+    onStart: () => {
+      console.log('🎤 [Frontend] Recording started');
+      // ✅ CRITICAL: Voice monitoring already started, no need to start again
+    },
+    onStop: () => {
+      console.log('🛑 [Frontend] Recording stopped');
+      // ✅ CRITICAL: Don't stop voice monitoring, keep it running
+    },
     onError: (error) => onError?.(error.message)
   });
 
-  const { isPlaying, isSupported: playbackSupported, playAudioChunk,  } = useAudioPlayback({
+  // ✅ CRITICAL: Get audio stream when component mounts
+  useEffect(() => {
+    getAudioStream();
+  }, [getAudioStream]);
+
+  // ✅ CRITICAL: Modified audio playback hook usage
+  const { isPlaying, isSupported: playbackSupported, playAudioChunk } = useAudioPlayback({
     onStart: () => console.log('🔊 Playback started'),
     onStop: () => console.log('🛑 Playback stopped'),
     onError: (error) => onError?.(error.message)
-  });
-
-  const { isSpeaking, volume } = useVoiceActivity({
-    onVoiceStart: handleVoiceStart,
-    onVoiceEnd: handleVoiceEnd
   });
 
   // WebSocket connection
@@ -94,9 +178,9 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
         console.log('🔌 WebSocket connected');
         setIsConnected(true);
         
-        // ✅ Fix: Use correct message type
+        // ✅ CRITICAL: Send start_conversation NOT start_call
         ws.send(JSON.stringify({
-          type: 'start_call',  // This is actually correct based on backend
+          type: 'start_conversation',  // ✅ FIXED: Match backend expectation
           brainId: 'default'
         }));
       };
@@ -137,15 +221,21 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
   // Handle binary audio from TTS
   const handleBinaryAudio = (audioData: ArrayBuffer) => {
     const audioBuffer = Buffer.from(audioData);
-    playAudioChunk(audioBuffer);
+    playAudioChunk(audioBuffer); // ✅ FIXED: Now playAudioChunk is defined
   };
 
   // Update message handling to match unmute.sh protocol
   const handleWebSocketMessage = (message: any) => {
+    console.log('📨 [Frontend] Received message:', message); // ✅ ADD LOGGING
+    
     switch (message.type) {
       case 'session_created':
         sessionIdRef.current = message.sessionId;
-        console.log('✅ Session created:', message.sessionId);
+        console.log('✅ [Frontend] Session created:', message.sessionId);
+        break;
+        
+      case 'conversation_started':  // ✅ ADD THIS CASE
+        console.log('🚀 [Frontend] Conversation started:', message.conversationId);
         break;
         
       case 'call_started':
@@ -243,6 +333,7 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
     setIsProcessing(false);
   };
 
+  // ✅ CRITICAL: Remove manual recording controls - let voice activity handle it
   return (
     <div className="max-w-md mx-auto p-6 bg-white rounded-lg shadow-lg">
       <h2 className="text-2xl font-bold mb-6 text-center">�� Voice AI Interface</h2>
@@ -270,33 +361,9 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
             style={{ width: `${Math.min(volume * 100, 100)}%` }}
           ></div>
         </div>
-      </div>
-
-      {/* Recording Controls */}
-      <div className="mb-4 flex justify-center space-x-4">
-        <button
-          onClick={handleStartRecording}
-          disabled={!isConnected || isRecording}
-          className={`px-6 py-3 rounded-lg font-medium transition-colors ${
-            isRecording 
-              ? 'bg-red-500 text-white cursor-not-allowed' 
-              : 'bg-blue-500 hover:bg-blue-600 text-white'
-          }`}
-        >
-          {isRecording ? '🔴 Recording...' : '�� Start Recording'}
-        </button>
-        
-        <button
-          onClick={handleStopRecording}
-          disabled={!isRecording}
-          className={`px-6 py-3 rounded-lg font-medium transition-colors ${
-            !isRecording 
-              ? 'bg-gray-300 text-gray-500 cursor-not-allowed' 
-              : 'bg-red-500 hover:bg-red-600 text-white'
-          }`}
-        >
-          🛑 Stop
-        </button>
+        <div className="text-sm text-gray-600 mt-2">
+          {isRecording ? ' Recording...' : '⚪ Waiting for voice...'}
+        </div>
       </div>
 
       {/* Interrupt Button */}
@@ -313,7 +380,7 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
 
       {/* Transcript Display */}
       <div className="mb-4 p-4 bg-blue-50 rounded-lg">
-        <h3 className="font-medium text-blue-900 mb-2">�� What you said:</h3>
+        <h3 className="font-medium text-blue-900 mb-2"> What you said:</h3>
         <p className="text-blue-800 min-h-[2rem]">
           {transcript || 'Start speaking...'}
         </p>
@@ -336,6 +403,7 @@ export const AudioStreamingInterface: React.FC<AudioStreamingInterfaceProps> = (
       <div className="mt-6 text-xs text-gray-500 text-center">
         <div>Audio Capture: {captureSupported ? '✅' : '❌'}</div>
         <div>Audio Playback: {playbackSupported ? '✅' : '❌'}</div>
+        <div>Voice Activity: {isSpeaking ? '🎤' : '🔇'}</div>
       </div>
     </div>
   );

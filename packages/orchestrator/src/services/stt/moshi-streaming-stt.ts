@@ -12,7 +12,7 @@ export interface MoshiStreamingSTTConfig extends StreamingSTTConfig {
 export class MoshiStreamingSTT extends BaseStreamingSTT {
   private moshiClient: MoshiWSClient;
   private partialTranscript: string = '';
-  private isConnected: boolean = false;
+  private _isConnected: boolean = false; // Rename to avoid conflict
 
   constructor(config: MoshiStreamingSTTConfig) {
     super({
@@ -22,7 +22,7 @@ export class MoshiStreamingSTT extends BaseStreamingSTT {
     });
     
     // Use WebSocket client with your VM endpoints
-    const endpoint = config.moshiEndpoint || process.env.KYUTAI_STT_WS_URL || 'ws://35.244.13.180:8082/api/asr-streaming';
+    const endpoint = config.moshiEndpoint || process.env.KYUTAI_STT_WS_URL || 'ws://34.14.197.169:8082/api/asr-streaming';
     this.moshiClient = new MoshiWSClient(endpoint, {
       protocol: 'fixed',
       audioMode: 'binary',
@@ -42,17 +42,19 @@ export class MoshiStreamingSTT extends BaseStreamingSTT {
           this.emit('error', error);
         }
       });
-      
-      this.isConnected = true;
-      console.log('✅ Moshi WebSocket STT initialized');
+  this._isConnected = true; // Update reference
+  this.connectionStatus = 'connected';
+  console.log('✅ Moshi WebSocket STT initialized');
     } catch (error) {
       console.error('❌ Failed to initialize Moshi WebSocket STT:', error);
-      throw error;
+  this._isConnected = false;
+  this.connectionStatus = 'disconnected';
+  throw error;
     }
   }
 
   async processAudioChunk(audioChunk: Buffer): Promise<StreamingSTTResult> {
-    if (!this.isProcessing || !this.isConnected) {
+    if (!this.isProcessing || !this._isConnected) {
       return this.createEmptyResult();
     }
 
@@ -111,6 +113,10 @@ export class MoshiStreamingSTT extends BaseStreamingSTT {
     this.emit('streaming_stopped', finalResult);
     console.log('🛑 Moshi STT streaming stopped');
     
+  // mark disconnected when stopped
+  this._isConnected = false;
+  this.connectionStatus = 'disconnected';
+
     return finalResult;
   }
 
@@ -218,5 +224,23 @@ export class MoshiStreamingSTT extends BaseStreamingSTT {
     this.isProcessing = false;
     this.audioBuffer = [];
     console.log('🗑️ Moshi Streaming STT destroyed');
+  this._isConnected = false;
+  this.connectionStatus = 'disconnected';
+  }
+
+  // Add the missing connect method
+  async connect(): Promise<void> {
+    try {
+      await this.initialize();
+      this._isConnected = true;
+    } catch (error) {
+      this._isConnected = false;
+      throw error;
+    }
+  }
+
+  // Add getter for isConnected to match base class signature
+  isConnected(): boolean {
+    return this._isConnected;
   }
 }

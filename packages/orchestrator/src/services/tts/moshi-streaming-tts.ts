@@ -3,6 +3,7 @@ import { MoshiWSClient } from 'kyutai-client/clients/moshi-ws-client'; // Use We
 
 export interface MoshiStreamingTTSConfig extends StreamingTTSConfig {
   moshiEndpoint?: string;
+  authToken?: string; // Add API key configuration
   audioConfig?: {
     audioEncoding: string;
     sampleRateHertz: number;
@@ -21,10 +22,11 @@ export class MoshiStreamingTTS extends BaseStreamingTTS {
     super(config);
     
     // Use WebSocket client with your VM endpoints
-    const endpoint = config.moshiEndpoint || process.env.KYUTAI_TTS_WS_URL || 'ws://35.244.13.180:8083/api/tts_streaming';
+    const endpoint = config.moshiEndpoint || process.env.KYUTAI_TTS_WS_URL || 'ws://34.14.197.169:8084/api/tts_streaming';
     this.moshiClient = new MoshiWSClient(endpoint, {
       protocol: 'fixed',
-      audioMode: 'binary'
+      audioMode: 'binary',
+      authToken: config.authToken // Pass the auth token
     });
   }
 

@@ -141,4 +141,17 @@ export abstract class BaseStreamingSTT extends EventEmitter {
       ...result
     });
   }
+
+  // Add connection health check
+  abstract isConnected(): boolean;
+  
+  // Add connection method
+  abstract connect(): Promise<void>;
+  
+  // Add connection status
+  protected connectionStatus: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
+  
+  getConnectionStatus(): string {
+    return this.connectionStatus;
+  }
 }
